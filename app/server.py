@@ -192,9 +192,59 @@ def api_upload_finalize():
 
     if kind == "sqlite":
         src = _chunk_path(files[0]["upload_id"])
-        dst = paths.new_project_sqlite_path(pid, files[0].get("filename") or "upload.db")
+        orig_name = files[0].get("filename") or "upload.db"
+        dst = paths.new_project_sqlite_path(pid, orig_name)
         _sh.move(str(src), str(dst))
         probe = gcdb_read.probe_gcdb(dst)
+        fmt = probe.get("format")
+
+        if fmt == "snapapp" and probe.get("ok"):
+            # Extract the 1× wide JPEG from every capture row — they match the
+            # reference panorama sub-views' ~65° HFoV far better than the
+            # zoomed-in burst frames would.
+            photos_dir = paths.project_photos_dir(pid)
+            extracted = gcdb_read.extract_snapapp_wide(dst, photos_dir)
+            if not extracted:
+                _sh.rmtree(paths.project_dir(pid), ignore_errors=True)
+                db.delete_project(pid)
+                return jsonify({"error": "SnapApp .db had no wide_jpeg rows"}), 400
+            # Preserve the per-photo GPS/bearing in project meta so the UI
+            # can render it even after extraction drops the BLOBs.
+            shot_meta = {e["filename"]: {
+                "shot_id": e["shot_id"],
+                "lat": e["lat"], "lon": e["lon"],
+                "bearing_deg": e["bearing_deg"],
+                "accuracy_m": e["accuracy_m"],
+                "captured_at": e["captured_at"],
+            } for e in extracted}
+            db.update_project_meta = getattr(db, "update_project_meta", None)
+            # (no helper — just overwrite via internal SQL below)
+            import json as _json
+            with db.conn() as c:
+                c.execute(
+                    "UPDATE projects SET meta_json = ? WHERE id = ?",
+                    (_json.dumps({
+                        "source": "snapapp",
+                        "original_filename": orig_name,
+                        "n_sqlite_shots": len(extracted),
+                        "bounds": probe.get("bounds"),
+                        "photo_meta": shot_meta,
+                    }), pid),
+                )
+            # Default snapapp-shot: one SFM run over every extracted photo
+            photo_stems = [Path(e["filename"]).stem for e in extracted]
+            db.create_shot(
+                pid, name=f"All {len(extracted)} shots (default)",
+                meta={"photo_stems": photo_stems,
+                      "photo_names": [e["filename"] for e in extracted]},
+            )
+            pipeline.start_megaloc_prematch(pid)
+            return jsonify({
+                "project_id": pid, "kind": kind,
+                "format": "snapapp", "n_shots": len(extracted),
+            })
+
+        # Legacy gcdb or unknown: keep the file around but no pipeline path.
         return jsonify({"project_id": pid, "kind": kind, "sqlite": probe})
 
     photos_dir = paths.project_photos_dir(pid)
@@ -250,9 +300,41 @@ def api_upload():
     pid = db.create_project(name or default_name, kind, meta={})
 
     if sqlite_file:
-        dst = paths.new_project_sqlite_path(pid, sqlite_file.filename or "upload.db")
+        orig_name = sqlite_file.filename or "upload.db"
+        dst = paths.new_project_sqlite_path(pid, orig_name)
         sqlite_file.save(str(dst))
         probe = gcdb_read.probe_gcdb(dst)
+        if probe.get("format") == "snapapp" and probe.get("ok"):
+            photos_dir = paths.project_photos_dir(pid)
+            extracted = gcdb_read.extract_snapapp_wide(dst, photos_dir)
+            if not extracted:
+                shutil.rmtree(paths.project_dir(pid), ignore_errors=True)
+                db.delete_project(pid)
+                return jsonify({"error": "SnapApp .db had no wide_jpeg rows"}), 400
+            shot_meta = {e["filename"]: {
+                "shot_id": e["shot_id"], "lat": e["lat"], "lon": e["lon"],
+                "bearing_deg": e["bearing_deg"], "accuracy_m": e["accuracy_m"],
+                "captured_at": e["captured_at"],
+            } for e in extracted}
+            import json as _json
+            with db.conn() as c:
+                c.execute(
+                    "UPDATE projects SET meta_json = ? WHERE id = ?",
+                    (_json.dumps({
+                        "source": "snapapp", "original_filename": orig_name,
+                        "n_sqlite_shots": len(extracted),
+                        "bounds": probe.get("bounds"), "photo_meta": shot_meta,
+                    }), pid),
+                )
+            photo_stems = [Path(e["filename"]).stem for e in extracted]
+            db.create_shot(
+                pid, name=f"All {len(extracted)} shots (default)",
+                meta={"photo_stems": photo_stems,
+                      "photo_names": [e["filename"] for e in extracted]},
+            )
+            pipeline.start_megaloc_prematch(pid)
+            return jsonify({"project_id": pid, "kind": kind,
+                            "format": "snapapp", "n_shots": len(extracted)})
         return jsonify({"project_id": pid, "kind": kind, "sqlite": probe})
 
     photos_dir = paths.project_photos_dir(pid)

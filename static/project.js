@@ -22,9 +22,10 @@ async function loadProject() {
   document.getElementById("projTag").innerHTML = tagBits.join(" • ");
 
   renderShots(p.shots || []);
-  renderPhotos(p.photos || [], p.megaloc_matches || {});
-  if (p.kind === "sqlite" && p.sqlite) {
-    renderSqlite(p.sqlite);
+  const photoMeta = (p.meta && p.meta.photo_meta) || {};
+  renderPhotos(p.photos || [], p.megaloc_matches || {}, photoMeta);
+  if (p.kind === "sqlite") {
+    renderSqlite(p.sqlite, p.meta || {});
   }
 }
 
@@ -123,7 +124,7 @@ function formatStatus(s) {
   }
 }
 
-function renderPhotos(photos, megalocMatches) {
+function renderPhotos(photos, megalocMatches, photoMeta) {
   const grid = document.getElementById("photosGrid");
   grid.innerHTML = "";
   if (!photos.length) {
@@ -133,6 +134,7 @@ function renderPhotos(photos, megalocMatches) {
   for (const name of photos) {
     const stem = name.replace(/\.[^/.]+$/, "");
     const match = megalocMatches[stem];
+    const meta = photoMeta[name];
     const th = document.createElement("div");
     th.className = "th";
     th.dataset.stem = stem;
@@ -140,10 +142,14 @@ function renderPhotos(photos, megalocMatches) {
     const scoreBadge = match
       ? `<div class="score ${scoreClass(match.score)}" title="${escapeHtml(match.shot_key)}">${match.score.toFixed(2)}</div>`
       : "";
+    const gpsLine = meta && meta.lat != null && meta.lon != null
+      ? `<div class="gps">${meta.lat.toFixed(5)},${meta.lon.toFixed(5)}${
+           meta.bearing_deg != null ? ` · ${Math.round(meta.bearing_deg)}°` : ""}</div>`
+      : "";
     th.innerHTML = `
       <img src="/api/projects/${PROJECT_ID}/photo/${encodeURIComponent(name)}" loading="lazy">
       ${scoreBadge}
-      <div class="lbl">${escapeHtml(name)}</div>
+      <div class="lbl">${escapeHtml(name)}${gpsLine}</div>
     `;
     th.addEventListener("click", () => {
       if (selected.has(stem)) {
@@ -165,12 +171,35 @@ function scoreClass(score) {
   return "score-bad";
 }
 
-function renderSqlite(info) {
+function renderSqlite(info, projMeta) {
   const sec = document.getElementById("sqliteSection");
   const body = document.getElementById("sqliteInfo");
   sec.style.display = "";
-  if (!info.ok) {
-    body.innerHTML = `<div style="color:#991b1b">Could not read SQLite: ${escapeHtml(info.error)}</div>`;
+  if (projMeta.source === "snapapp") {
+    // Extracted SnapApp session — shown as a richer summary.
+    const b = projMeta.bounds;
+    const bounds = b
+      ? `${b.lat_min.toFixed(5)}..${b.lat_max.toFixed(5)}, ${b.lon_min.toFixed(5)}..${b.lon_max.toFixed(5)}`
+      : "n/a";
+    body.innerHTML = `
+      <div class="sqlite-summary">
+        <div><span class="k">source:</span> SnapApp capture session</div>
+        <div><span class="k">original file:</span> ${escapeHtml(projMeta.original_filename || "")}</div>
+        <div><span class="k">shots extracted:</span> ${projMeta.n_sqlite_shots}</div>
+        <div><span class="k">GPS bounds:</span> ${bounds}</div>
+      </div>
+      <div style="margin-top:10px; color:#6b7280; font-size:12px">
+        Each shot's 1× wide JPEG was extracted to the photo grid below — tap
+        any to pick a subset, then use <b>New shot from selection</b> to run
+        shotmatch_pose on just those frames. The default shot above runs
+        SFM across every extracted photo.
+      </div>
+    `;
+    return;
+  }
+  if (!info || !info.ok) {
+    const err = info ? info.error : "no sqlite info";
+    body.innerHTML = `<div style="color:#991b1b">Could not read SQLite: ${escapeHtml(err)}</div>`;
     return;
   }
   const sample = (info.poses_sample || []).slice(0, 6);
@@ -179,6 +208,7 @@ function renderSqlite(info) {
     : "n/a";
   body.innerHTML = `
     <div class="sqlite-summary">
+      <div><span class="k">format:</span> legacy GCDB</div>
       <div><span class="k">capture:</span> ${escapeHtml(info.capture_name || "(none)")}</div>
       <div><span class="k">tables:</span> ${(info.tables || []).join(", ")}</div>
       <div><span class="k">poses:</span> ${info.pose_count}</div>
@@ -187,10 +217,6 @@ function renderSqlite(info) {
         <ul>${sample.map(p =>
           `<li>id=${p.id} (${p.lat && p.lat.toFixed(5)}, ${p.lon && p.lon.toFixed(5)})</li>`
         ).join("")}</ul></div>` : ""}
-    </div>
-    <div style="margin-top:10px; color:#6b7280; font-size:12px">
-      Note: SQLite-only projects require companion imagery on disk to run shotmatch_pose.
-      This build displays SQLite metadata only.
     </div>
   `;
 }

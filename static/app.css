@@ -114,6 +114,11 @@ button.danger:hover { background: #b91c1c; }
 .thumb-grid .th .score.score-ok { background: #2563eb; }
 .thumb-grid .th .score.score-weak { background: #c2410c; }
 .thumb-grid .th .score.score-bad { background: #991b1b; }
+.thumb-grid .th .gps {
+  font-size: 9px; color: #cbd5e1;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 .shot { border: 1px solid #e4e6ec; border-radius: 8px; padding: 12px;
         margin-bottom: 10px; background: #fafbfd; }
