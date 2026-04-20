@@ -6,6 +6,7 @@ const selected = new Set();
 
 let latestProject = null;
 const openLogs = new Set();
+const logCache = new Map();  // shot_id -> last fetched log text
 
 async function loadProject() {
   const r = await fetch(`/api/projects/${PROJECT_ID}`);
@@ -78,9 +79,14 @@ function renderShots(shots) {
           ${canDelete ? `<button class="small secondary btn-del" data-id="${s.id}">✕</button>` : ""}
         </div>
       </div>
-      <pre class="log" id="log-${s.id}"></pre>
+      <pre class="log${openLogs.has(s.id) ? " open" : ""}" id="log-${s.id}">${escapeHtml(logCache.get(s.id) || "")}</pre>
     `;
     host.appendChild(el);
+    // Keep scrolled to the bottom so new lines stay visible across polls
+    if (openLogs.has(s.id)) {
+      const logEl = el.querySelector(".log");
+      if (logEl) logEl.scrollTop = logEl.scrollHeight;
+    }
   }
 
   host.querySelectorAll(".btn-run").forEach(b => b.addEventListener("click", async () => {
@@ -125,25 +131,29 @@ function renderShots(shots) {
     openLogs.add(id);
     await refreshLog(id);
   }));
-  // Re-apply .open for any logs the user had expanded — poll re-renders
-  // otherwise clobber them.
+  // Refresh content for any open logs. The pre element is pre-populated
+  // with cached text during render so there's no flicker; this just
+  // pulls any new lines since the last poll.
   for (const id of openLogs) {
-    const logEl = document.getElementById(`log-${id}`);
-    if (logEl) {
-      logEl.classList.add("open");
+    if (document.getElementById(`log-${id}`)) {
       refreshLog(id);
     } else {
-      openLogs.delete(id);  // shot deleted
+      openLogs.delete(id);  // shot was deleted
     }
   }
 }
 
 async function refreshLog(id) {
+  const r = await fetch(`/api/shots/${id}/log?tail=400`);
+  const text = await r.text();
+  logCache.set(id, text);
+  // Element may have been replaced by a re-render since we started; re-fetch.
   const el = document.getElementById(`log-${id}`);
   if (!el || !el.classList.contains("open")) return;
-  const r = await fetch(`/api/shots/${id}/log?tail=400`);
-  el.textContent = await r.text();
-  el.scrollTop = el.scrollHeight;
+  if (el.textContent === text) return;  // no change, skip the scroll jump
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  el.textContent = text;
+  if (nearBottom) el.scrollTop = el.scrollHeight;
 }
 
 function formatStatus(s) {
