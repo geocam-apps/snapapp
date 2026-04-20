@@ -23,6 +23,32 @@ SFM_ENV = os.environ.copy()
 # Track in-flight shots: shot_id -> thread
 RUNNING = {}
 
+# Track in-flight megaloc prematching: project_id -> thread
+MEGALOC_RUNNING = {}
+
+
+def start_megaloc_prematch(project_id: str):
+    """Kick off MegaLoc in the background at upload time so matches are
+    visible in the UI before the user triggers a shot."""
+    if project_id in MEGALOC_RUNNING:
+        return
+    csv_path = paths.project_megaloc_csv(project_id)
+    if csv_path.exists():
+        return  # already cached
+
+    def _run():
+        try:
+            run_megaloc_for_project(project_id)
+        except Exception:
+            # Non-fatal; the shot run will retry and surface the error.
+            pass
+        finally:
+            MEGALOC_RUNNING.pop(project_id, None)
+
+    t = threading.Thread(target=_run, daemon=True)
+    MEGALOC_RUNNING[project_id] = t
+    t.start()
+
 
 def log_append(path: Path, msg: str):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,8 +113,14 @@ def _read_megaloc_csv(csv_path: Path) -> dict:
     return out
 
 
-def _choose_anchor(matches: dict, photo_stems: list) -> tuple:
-    """Given megaloc matches, pick the best-scoring photo stem as anchor."""
+def _choose_anchor(matches: dict, photo_stems: list, pinned_stem: str = None) -> tuple:
+    """Given megaloc matches, pick the best-scoring photo stem as anchor.
+
+    If `pinned_stem` is supplied (and has a MegaLoc match), use it directly
+    — lets the user override a weak auto-pick.
+    """
+    if pinned_stem and pinned_stem in matches:
+        return pinned_stem, matches[pinned_stem]
     best = None
     for stem in photo_stems:
         m = matches.get(stem)
@@ -147,7 +179,9 @@ def _process_shot(shot_id: str):
         matches = run_megaloc_for_project(project["id"])
         log_append(log_path, f"[megaloc] got {len(matches)} matches total")
 
-        anchor_stem, anchor_info = _choose_anchor(matches, photo_stems)
+        anchor_stem, anchor_info = _choose_anchor(
+            matches, photo_stems, pinned_stem=meta.get("anchor_override"),
+        )
         anchor_shot_id = anchor_info["shot_id"]
         anchor_capture = anchor_info["capture"]
         anchor_score = anchor_info["score"]

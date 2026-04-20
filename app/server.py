@@ -87,6 +87,15 @@ def api_project(project_id):
     if sqlite_path.exists():
         p["sqlite"] = gcdb_read.probe_gcdb(sqlite_path)
         p["sqlite"]["poses_sample"] = gcdb_read.list_poses(sqlite_path, limit=50)
+    # Include MegaLoc matches if available
+    csv_path = paths.project_megaloc_csv(project_id)
+    p["megaloc_ready"] = csv_path.exists()
+    p["megaloc_running"] = project_id in pipeline.MEGALOC_RUNNING
+    if csv_path.exists():
+        try:
+            p["megaloc_matches"] = pipeline._read_megaloc_csv(csv_path)
+        except Exception:
+            p["megaloc_matches"] = {}
     return jsonify(p)
 
 
@@ -160,6 +169,9 @@ def api_upload():
         pid, name="All photos (default)",
         meta={"photo_stems": photo_stems, "photo_names": saved},
     )
+    # Kick off MegaLoc in the background so anchor matches are ready before
+    # the user triggers the shot — gives them visibility into match quality.
+    pipeline.start_megaloc_prematch(pid)
     return jsonify({"project_id": pid, "kind": kind, "n_photos": len(saved)})
 
 
@@ -175,6 +187,7 @@ def api_create_shot(project_id):
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "Unnamed shot").strip()
     photo_stems = data.get("photo_stems") or []
+    anchor_override = (data.get("anchor_override") or "").strip() or None
     if not photo_stems:
         return jsonify({"error": "Need at least one photo_stem"}), 400
 
@@ -183,9 +196,13 @@ def api_create_shot(project_id):
     photo_stems = [s for s in photo_stems if s in existing]
     if not photo_stems:
         return jsonify({"error": "None of the selected photos exist"}), 400
+    if anchor_override and anchor_override not in photo_stems:
+        return jsonify({"error": "anchor_override must be one of the selected photos"}), 400
 
-    sid = db.create_shot(project_id, name,
-                         meta={"photo_stems": photo_stems})
+    meta = {"photo_stems": photo_stems}
+    if anchor_override:
+        meta["anchor_override"] = anchor_override
+    sid = db.create_shot(project_id, name, meta=meta)
     return jsonify({"shot_id": sid})
 
 

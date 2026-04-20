@@ -4,6 +4,8 @@ const PROJECT_ID = window.PROJECT_ID;
 
 const selected = new Set();
 
+let latestProject = null;
+
 async function loadProject() {
   const r = await fetch(`/api/projects/${PROJECT_ID}`);
   if (!r.ok) {
@@ -12,11 +14,15 @@ async function loadProject() {
     return;
   }
   const p = await r.json();
+  latestProject = p;
   document.getElementById("projTitle").textContent = p.name;
-  document.getElementById("projTag").textContent = `${p.kind} • ${p.photos.length} photos`;
+  const tagBits = [p.kind, `${p.photos.length} photos`];
+  if (p.megaloc_running) tagBits.push(`<span style="color:#1e40af">MegaLoc running…</span>`);
+  else if (p.megaloc_ready) tagBits.push(`<span style="color:#065f46">MegaLoc ready</span>`);
+  document.getElementById("projTag").innerHTML = tagBits.join(" • ");
 
   renderShots(p.shots || []);
-  renderPhotos(p.photos || []);
+  renderPhotos(p.photos || [], p.megaloc_matches || {});
   if (p.kind === "sqlite" && p.sqlite) {
     renderSqlite(p.sqlite);
   }
@@ -117,7 +123,7 @@ function formatStatus(s) {
   }
 }
 
-function renderPhotos(photos) {
+function renderPhotos(photos, megalocMatches) {
   const grid = document.getElementById("photosGrid");
   grid.innerHTML = "";
   if (!photos.length) {
@@ -126,12 +132,17 @@ function renderPhotos(photos) {
   }
   for (const name of photos) {
     const stem = name.replace(/\.[^/.]+$/, "");
+    const match = megalocMatches[stem];
     const th = document.createElement("div");
     th.className = "th";
     th.dataset.stem = stem;
     if (selected.has(stem)) th.classList.add("selected");
+    const scoreBadge = match
+      ? `<div class="score ${scoreClass(match.score)}" title="${escapeHtml(match.shot_key)}">${match.score.toFixed(2)}</div>`
+      : "";
     th.innerHTML = `
       <img src="/api/projects/${PROJECT_ID}/photo/${encodeURIComponent(name)}" loading="lazy">
+      ${scoreBadge}
       <div class="lbl">${escapeHtml(name)}</div>
     `;
     th.addEventListener("click", () => {
@@ -145,6 +156,13 @@ function renderPhotos(photos) {
     });
     grid.appendChild(th);
   }
+}
+
+function scoreClass(score) {
+  if (score >= 0.5) return "score-high";
+  if (score >= 0.3) return "score-ok";
+  if (score >= 0.15) return "score-weak";
+  return "score-bad";
 }
 
 function renderSqlite(info) {
@@ -184,10 +202,31 @@ document.getElementById("newShotBtn").addEventListener("click", async () => {
   }
   const name = prompt("Name this shot:", `Shot ${new Date().toISOString().slice(11,19)}`);
   if (name === null) return;
+
+  // Offer anchor override if we have MegaLoc scores
+  let anchorOverride = null;
+  const matches = (latestProject && latestProject.megaloc_matches) || {};
+  const scoredStems = [...selected].filter(s => matches[s])
+    .sort((a, b) => matches[b].score - matches[a].score);
+  if (scoredStems.length >= 2) {
+    const choices = scoredStems.map(s =>
+      `  ${s} — ${matches[s].score.toFixed(3)} → ${matches[s].shot_key.split('/').pop()}`
+    ).join("\n");
+    const top = scoredStems[0];
+    const picked = prompt(
+      `Anchor photo (MegaLoc top = ${top}, score ${matches[top].score.toFixed(3)}).\n` +
+      `Enter a photo stem to override, or leave blank to auto-pick:\n\n${choices}`,
+      ""
+    );
+    if (picked === null) return;
+    if (picked.trim()) anchorOverride = picked.trim();
+  }
+  const body = {name, photo_stems: [...selected]};
+  if (anchorOverride) body.anchor_override = anchorOverride;
   const r = await fetch(`/api/projects/${PROJECT_ID}/shots`, {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({name, photo_stems: [...selected]}),
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     alert("Failed to create shot: " + await r.text());
