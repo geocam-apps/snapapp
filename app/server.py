@@ -29,6 +29,19 @@ app = Flask(
     template_folder=str(TEMPLATES_DIR),
 )
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024 * 1024  # 8 GB
+# Don't let browsers (or Cloudflare) cache the JS/CSS — when the chunked
+# uploader shipped, users stuck on the old single-shot uploader tried to
+# POST 330 MB in one request and got killed at the edge with no server log.
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
+
+@app.after_request
+def _no_cache_static(resp):
+    if request.path.startswith("/static/") or request.path.endswith((".html", "/")):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
 
 PHOTO_EXTS = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".HEIC", ".HEIF", ".JPG", ".JPEG", ".PNG"}
 
@@ -290,7 +303,25 @@ def api_upload_finalize():
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """Create a new project. Accepts photos[] (image sequence) OR sqlite file."""
+    """Create a new project. Accepts photos[] (image sequence) OR sqlite file.
+
+    Legacy single-shot path. For anything above ~80 MB the Cloudflare edge
+    will reject it before it reaches us (100 MB body cap on free tier).
+    New clients use /api/upload/chunk → /api/upload/finalize; keep this
+    for small photo bundles and as a fallback.
+    """
+    # Reject oversize single-shots early so stale browsers get a clear error
+    # instead of a Cloudflare 413 at the edge.
+    cl = request.content_length or 0
+    if cl > 90 * 1024 * 1024:
+        return jsonify({
+            "error": (
+                "Upload too large for the single-shot path "
+                f"({cl // 1024 // 1024} MB). "
+                "Your browser is using an outdated uploader — hard-refresh "
+                "the page (Ctrl/Cmd+Shift+R) to load the chunked uploader."
+            ),
+        }), 413
     name = (request.form.get("name") or "").strip()
     photo_files = request.files.getlist("photos")
     sqlite_file = request.files.get("sqlite")
