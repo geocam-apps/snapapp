@@ -356,6 +356,192 @@ def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
         raise RuntimeError(f"SFM failed (returncode={proc.returncode})")
 
 
+def _run_register_independent(shot_id, log_path, staging_dir, matches,
+                               photo_stems, shot_out_dir):
+    """Register each phone photo independently against the reference model.
+
+    This is the right default for SnapApp-style captures: individual
+    shutter presses at different positions along a street rarely share
+    enough texture for sequence SFM's SIFT chaining to work. Each photo
+    gets its own register_photo.py pass (DISK+LightGlue vs ~10 nearby
+    reference shots), then we union the per-photo COLMAP models into one
+    and synthesize a sequence.json the viewer can consume.
+
+    Ref anchor for each photo: its best GPS-valid MegaLoc match, falling
+    back to the nearest ref by GPS if none of the top-K is valid.
+    """
+    sys.path.insert(0, str(paths.SHOTMATCH_REPO))
+    from colmap_io import read_model, write_model_text, Camera, Image as ColImage
+
+    per_photo_dir = shot_out_dir / "_per_photo"
+    per_photo_dir.mkdir(parents=True, exist_ok=True)
+    results = []  # per-photo: {stem, ok, anchor_shot, anchor_capture, mini_dir, pose?, err?}
+
+    for i, stem in enumerate(photo_stems):
+        # Decide this photo's anchor
+        m = matches.get(stem) or {}
+        pick = m.get("gps_best") or (m.get("top_k") or [None])[0]
+        if pick is None:
+            # pure-GPS fallback for this photo
+            from . import ref_index
+            idx = ref_index.load()
+            phone_lat = m.get("_phone_lat")
+            phone_lon = m.get("_phone_lon")
+            if idx and phone_lat is not None:
+                nearest = min(
+                    idx.items(),
+                    key=lambda kv: ref_index.haversine_m(
+                        phone_lat, phone_lon, kv[1]["lat"], kv[1]["lon"])
+                )
+                shot_key, _pos = nearest
+                capture, shot_id = (shot_key.rsplit("/", 1)
+                                    if "/" in shot_key else (None, shot_key))
+                pick = {"shot_key": shot_key, "shot_id": shot_id,
+                        "capture": capture, "score": 0.0}
+        if pick is None:
+            results.append({"stem": stem, "ok": False,
+                            "err": "no anchor candidate"})
+            continue
+
+        anchor_shot_id = pick["shot_id"]
+        anchor_capture = pick["capture"] or ""
+        photo_path = staging_dir / next(
+            (f.name for f in staging_dir.iterdir() if f.stem == stem), ""
+        )
+        if not photo_path.exists():
+            results.append({"stem": stem, "ok": False,
+                            "err": "photo file not found"})
+            continue
+
+        mini_dir = per_photo_dir / stem
+        mini_dir.mkdir(parents=True, exist_ok=True)
+
+        frac = 0.20 + 0.70 * ((i + 0.5) / max(1, len(photo_stems)))
+        db.update_shot(
+            shot_id, phase="phase1",
+            phase_label=f"Registering {stem} ({i+1}/{len(photo_stems)})",
+            progress=frac,
+        )
+
+        cmd = [
+            "python3", "-u", str(paths.SHOTMATCH_REPO / "register_photo.py"),
+            "--photo", str(photo_path),
+            "--model", str(paths.REF_MODEL_DIR),
+            "--images", str(paths.REF_IMAGES_DIR),
+            "--matched-shot", anchor_shot_id,
+            "--capture", anchor_capture,
+            "--output", str(mini_dir),
+            "--n-shots", "10",
+        ]
+        log_append(log_path, f"[sfm] ({i+1}/{len(photo_stems)}) {stem} "
+                             f"→ ref {anchor_shot_id} (score={pick['score']:.3f})")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=CHILD_ENV,
+        )
+        for line in proc.stdout:
+            log_append(log_path, f"[sfm]   {line.rstrip()}")
+        proc.wait()
+
+        sidecar = mini_dir / f"{stem}_pose.json"
+        if proc.returncode == 0 and sidecar.exists():
+            with open(sidecar) as f:
+                pose = json.load(f)
+            results.append({"stem": stem, "ok": True,
+                            "anchor_shot": anchor_shot_id,
+                            "anchor_capture": pick["capture"],
+                            "anchor_score": pick["score"],
+                            "mini_dir": mini_dir,
+                            "pose": pose})
+        else:
+            results.append({"stem": stem, "ok": False,
+                            "anchor_shot": anchor_shot_id,
+                            "err": f"register_photo rc={proc.returncode}"})
+
+    # Merge: take the first successful mini-project's model as the base
+    # (it already has refs + triangulated ref points + its query). For
+    # subsequent successes, graft in their query Image + Camera.
+    successful = [r for r in results if r["ok"]]
+    if not successful:
+        raise RuntimeError(
+            "No photos registered. See log for per-photo failures."
+        )
+
+    base = successful[0]
+    base_model_dir = base["mini_dir"] / "model"
+    cams, imgs, pts = read_model(base_model_dir)
+    next_cam_id = (max(cams.keys()) + 1) if cams else 1
+    next_img_id = (max(imgs.keys()) + 1) if imgs else 1
+
+    for r in successful[1:]:
+        m_cams, m_imgs, _ = read_model(r["mini_dir"] / "model")
+        for img in m_imgs.values():
+            if not img.name.startswith("query/"):
+                continue  # ref images are already present from the base
+            if any(bi.name == img.name for bi in imgs.values()):
+                continue
+            cam = m_cams[img.camera_id]
+            cam_id = next_cam_id
+            cams[cam_id] = Camera(
+                id=cam_id, model=cam.model, width=cam.width,
+                height=cam.height, params=cam.params,
+            )
+            next_cam_id += 1
+            imgs[next_img_id] = ColImage(
+                id=next_img_id, qvec=img.qvec, tvec=img.tvec,
+                camera_id=cam_id, name=img.name, xys=[], point3D_ids=[],
+            )
+            next_img_id += 1
+
+    model_out = shot_out_dir / "model"
+    if model_out.exists():
+        shutil.rmtree(model_out)
+    model_out.mkdir(parents=True)
+    write_model_text(cams, imgs, pts, model_out)
+
+    # Move query JPEGs into the expected location for the viewer.
+    images_out = shot_out_dir / "images"
+    images_out.mkdir(exist_ok=True)
+    for r in successful:
+        src = r["mini_dir"] / f"{r['stem']}.jpg"
+        if src.exists():
+            shutil.move(str(src), str(images_out / f"{r['stem']}.jpg"))
+
+    # Synthesize sequence.json from per-photo poses.
+    queries = []
+    for r in successful:
+        p = r["pose"]
+        queries.append({
+            "stem": r["stem"],
+            "image_name": f"query/{r['stem']}.jpg",
+            "qvec": p.get("qvec"), "tvec": p.get("tvec"),
+            "center_world": p.get("center_world"),
+            "num_observations": p.get("num_observations"),
+            "num_points2D": p.get("num_points2D"),
+            "latlon": p.get("latlon"),
+            "anchor_shot": r["anchor_shot"],
+            "anchor_score": r.get("anchor_score"),
+        })
+    anchors = {r["stem"]: {"shot_id": r["anchor_shot"],
+                          "capture": r.get("anchor_capture")}
+               for r in successful}
+    failed_stems = [r["stem"] for r in results if not r["ok"]]
+    summary = {
+        "sequence_name": shot_out_dir.name,
+        "method": "independent per-photo PnP vs ref-triangulated scene",
+        "n_queries": len(photo_stems),
+        "n_registered": len(successful),
+        "failed": failed_stems,
+        "anchors": anchors,
+        "queries": queries,
+    }
+    with open(shot_out_dir / "sequence.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # Clean up per-photo work dirs
+    shutil.rmtree(per_photo_dir, ignore_errors=True)
+
+
 def _run_register_photo(shot_id, log_path, photo_path, anchor_stem,
                          anchor_shot_id, anchor_capture, shot_out_dir):
     """Single-photo PnP via register_photo.py.
@@ -509,17 +695,30 @@ def _process_shot(shot_id: str):
         db.update_shot(shot_id, phase="sfm", phase_label="Preparing SFM",
                        progress=0.15, n_queries=len(photo_files))
 
+        # Mode dispatch:
+        #   single photo  → register_photo.py (PnP)
+        #   2+ photos, default  → independent per-photo (one PnP per photo,
+        #                         results unioned). Right for scattered
+        #                         shutter presses (SnapApp style).
+        #   2+ photos, meta.sfm_mode="sequence"  → register_sequence_natural.py
+        #                         (chains phone photos via SIFT). Right for
+        #                         densely-overlapping walkthrough sequences.
         if len(photo_files) == 1:
             anchor_photo = staging_dir / photo_files[0].name
             _run_register_photo(
                 shot_id, log_path, anchor_photo, anchor_stem,
                 anchor_shot_id, anchor_capture, shot_out_dir,
             )
-        else:
+        elif meta.get("sfm_mode") == "sequence":
             _run_register_sequence(
                 shot_id, log_path, staging_dir, anchor_stem,
                 anchor_shot_id, anchor_capture, shot_out_dir,
                 n_shots_neighbours=int(meta.get("n_shots") or 15),
+            )
+        else:
+            _run_register_independent(
+                shot_id, log_path, staging_dir, matches, photo_stems,
+                shot_out_dir,
             )
 
         summary_path = shot_out_dir / "sequence.json"
