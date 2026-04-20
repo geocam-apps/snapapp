@@ -6,7 +6,8 @@ const selected = new Set();
 
 let latestProject = null;
 const openLogs = new Set();
-const logCache = new Map();  // shot_id -> last fetched log text
+const logCache = new Map();         // shot_id -> last fetched log text
+const logScrollState = new Map();   // shot_id -> {scrollTop, pinnedBottom}
 
 async function loadProject() {
   const r = await fetch(`/api/projects/${PROJECT_ID}`);
@@ -33,6 +34,15 @@ async function loadProject() {
 
 function renderShots(shots) {
   const host = document.getElementById("shotsList");
+  // Capture scroll state of any currently-open log panes before the
+  // DOM gets wiped — new <pre> elements otherwise default to scrollTop=0.
+  for (const id of openLogs) {
+    const el = document.getElementById(`log-${id}`);
+    if (el) {
+      const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      logScrollState.set(id, {scrollTop: el.scrollTop, pinnedBottom: pinned});
+    }
+  }
   host.innerHTML = "";
   if (!shots.length) {
     host.innerHTML = `<div style="color:#6b7280;font-size:13px">No shots yet.</div>`;
@@ -82,24 +92,43 @@ function renderShots(shots) {
       <pre class="log${openLogs.has(s.id) ? " open" : ""}" id="log-${s.id}">${escapeHtml(logCache.get(s.id) || "")}</pre>
     `;
     host.appendChild(el);
-    // Keep scrolled to the bottom so new lines stay visible across polls
+    // Restore the user's previous scroll position (or keep pinned to bottom
+    // if they were already there when the last poll hit).
     if (openLogs.has(s.id)) {
       const logEl = el.querySelector(".log");
-      if (logEl) logEl.scrollTop = logEl.scrollHeight;
+      const saved = logScrollState.get(s.id);
+      if (logEl) {
+        if (saved?.pinnedBottom ?? true) {
+          logEl.scrollTop = logEl.scrollHeight;
+        } else {
+          logEl.scrollTop = saved.scrollTop;
+        }
+      }
     }
   }
 
   host.querySelectorAll(".btn-run").forEach(b => b.addEventListener("click", async () => {
     const id = b.dataset.id;
-    // Warn before burning SFM time on a shot whose best anchor is in the
-    // MegaLoc noise band (< 0.15). It'll fail in Phase 1 every time.
     const shot = (latestProject?.shots || []).find(s => s.id === id);
     const mm = latestProject?.megaloc_matches || {};
     const stems = shot?.meta?.photo_stems || [];
+    // Sequence SFM needs ≥ 2 overlapping views — Phase 3 mapper fails
+    // instantly with "No images with matches found" on a single query.
+    if (stems.length < 2) {
+      alert(
+        `This shot has only ${stems.length} photo${stems.length === 1 ? "" : "s"}.\n\n` +
+        `Sequence SFM needs at least 2 overlapping views to triangulate ` +
+        `3D points. Pick a cluster of nearby photos (usually 4+) and create ` +
+        `a new shot from the selection.`
+      );
+      return;
+    }
+    // Warn before burning SFM time on a shot whose best anchor is in the
+    // MegaLoc noise band (< 0.15). It'll fail in Phase 1 every time.
     let bestScore = -1, bestStem = null;
-    for (const s of stems) {
-      if (mm[s] && mm[s].score > bestScore) {
-        bestScore = mm[s].score; bestStem = s;
+    for (const ps of stems) {
+      if (mm[ps] && mm[ps].score > bestScore) {
+        bestScore = mm[ps].score; bestStem = ps;
       }
     }
     if (bestScore >= 0 && bestScore < 0.15) {
@@ -125,11 +154,15 @@ function renderShots(shots) {
     if (logEl.classList.contains("open")) {
       logEl.classList.remove("open");
       openLogs.delete(id);
+      logScrollState.delete(id);
       return;
     }
     logEl.classList.add("open");
     openLogs.add(id);
+    // New opens start pinned to bottom.
+    logScrollState.set(id, {scrollTop: 0, pinnedBottom: true});
     await refreshLog(id);
+    logEl.scrollTop = logEl.scrollHeight;
   }));
   // Refresh content for any open logs. The pre element is pre-populated
   // with cached text during render so there's no flicker; this just

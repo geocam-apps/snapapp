@@ -747,6 +747,14 @@ def api_run_shot(shot_id):
         abort(404)
     if shot["status"] == "running":
         return jsonify({"ok": True, "already_running": True})
+    stems = (shot.get("meta") or {}).get("photo_stems") or []
+    if len(stems) < 2:
+        return jsonify({
+            "error": (
+                f"Shot has {len(stems)} photo(s); sequence SFM needs at least "
+                "two overlapping views. Pick more photos and create a new shot."
+            ),
+        }), 400
     pipeline.run_shot(shot_id)
     return jsonify({"ok": True})
 
