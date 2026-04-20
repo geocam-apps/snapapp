@@ -136,7 +136,6 @@ def api_upload_chunk():
       offset:    byte offset this chunk starts at (must equal current size)
       chunk:     binary blob
     """
-    import uuid
     upload_id = request.form.get("upload_id") or ""
     try:
         offset = int(request.form.get("offset") or "0")
@@ -146,7 +145,11 @@ def api_upload_chunk():
     if not chunk:
         return jsonify({"error": "no chunk"}), 400
 
-    path = _chunk_path(upload_id)
+    try:
+        path = _chunk_path(upload_id)
+    except Exception as e:
+        return jsonify({"error": f"bad upload_id: {e}"}), 400
+
     existing = path.stat().st_size if path.exists() else 0
     if offset != existing:
         return jsonify({
@@ -154,9 +157,15 @@ def api_upload_chunk():
             "expected": existing, "got": offset,
         }), 409
     # Append
-    with open(path, "ab") as f:
-        chunk.save(f)
-    return jsonify({"upload_id": upload_id, "size": path.stat().st_size})
+    try:
+        with open(path, "ab") as f:
+            chunk.save(f)
+    except Exception as e:
+        app.logger.exception("chunk write failed")
+        return jsonify({"error": f"write failed: {type(e).__name__}: {e}"}), 500
+    size = path.stat().st_size
+    app.logger.info(f"chunk upload_id={upload_id} offset={offset} -> size={size}")
+    return jsonify({"upload_id": upload_id, "size": size})
 
 
 @app.route("/api/upload/finalize", methods=["POST"])
@@ -197,6 +206,8 @@ def api_upload_finalize():
         _sh.move(str(src), str(dst))
         probe = gcdb_read.probe_gcdb(dst)
         fmt = probe.get("format")
+        if not probe.get("ok") or fmt == "unknown":
+            probe["inspection"] = gcdb_read.inspect(dst)
 
         if fmt == "snapapp" and probe.get("ok"):
             # Extract the 1× wide JPEG from every capture row — they match the
@@ -304,6 +315,8 @@ def api_upload():
         dst = paths.new_project_sqlite_path(pid, orig_name)
         sqlite_file.save(str(dst))
         probe = gcdb_read.probe_gcdb(dst)
+        if not probe.get("ok") or probe.get("format") == "unknown":
+            probe["inspection"] = gcdb_read.inspect(dst)
         if probe.get("format") == "snapapp" and probe.get("ok"):
             photos_dir = paths.project_photos_dir(pid)
             extracted = gcdb_read.extract_snapapp_wide(dst, photos_dir)

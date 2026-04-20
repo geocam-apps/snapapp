@@ -11,22 +11,67 @@ import sqlite3
 from pathlib import Path
 
 
+def _table_columns(cur, table):
+    try:
+        return {r[1] for r in cur.execute(f'PRAGMA table_info("{table}")')}
+    except Exception:
+        return set()
+
+
+def inspect(path: Path) -> dict:
+    """Return a debug-friendly summary of the sqlite's tables/columns.
+
+    Always returns something, even on unreadable files — callers use this
+    to surface actionable errors in the UI.
+    """
+    out = {"exists": Path(path).exists(), "tables": {}}
+    if not out["exists"]:
+        out["error"] = "file not found"
+        return out
+    try:
+        conn = sqlite3.connect(str(path))
+        cur = conn.cursor()
+        for row in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ):
+            name = row[0]
+            out["tables"][name] = sorted(_table_columns(cur, name))
+        conn.close()
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def detect_format(path: Path) -> str:
-    """Return 'snapapp', 'gcdb', or 'unknown'."""
+    """Return 'snapapp', 'gcdb', or 'unknown'.
+
+    SnapApp detection is lenient: any table named `shots` (case-insensitive)
+    that has a BLOB-ish column with 'jpeg' / 'jpg' / 'image' in its name
+    counts. This tolerates schema drift — the user's real captures can have
+    burst_frames missing, additional columns, or a different JPEG column
+    name — and we just need to know there are images to extract.
+    """
     if not Path(path).exists():
         return "unknown"
     try:
         conn = sqlite3.connect(str(path))
         cur = conn.cursor()
-        tables = {r[0] for r in cur.execute(
+        tables = {r[0]: r[0] for r in cur.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
-        if "shots" in tables and "burst_frames" in tables:
-            cols = {r[1] for r in cur.execute("PRAGMA table_info(shots)")}
-            if "mid_jpeg" in cols and "wide_jpeg" in cols:
+        lower_tables = {k.lower(): k for k in tables}
+
+        shots_name = lower_tables.get("shots")
+        if shots_name:
+            cols = _table_columns(cur, shots_name)
+            has_image_col = any(
+                any(kw in c.lower() for kw in ("jpeg", "jpg", "image", "photo"))
+                for c in cols
+            )
+            if has_image_col:
                 conn.close()
                 return "snapapp"
-        if "poses" in tables:
+        if "poses" in lower_tables:
             conn.close()
             return "gcdb"
         conn.close()
@@ -109,13 +154,39 @@ def probe_snapapp(path: Path) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-def extract_snapapp_wide(path: Path, out_dir: Path) -> list:
-    """Extract the 1x `wide_jpeg` BLOB for every shot into `out_dir`.
+def _pick_image_column(cur, table):
+    """Pick the best image column from a shots-like table.
+    Preference: wide_jpeg > mid_jpeg > anything *_jpeg > anything with 'image'/'photo'."""
+    cols = _table_columns(cur, table)
+    if not cols:
+        return None
+    for preferred in ("wide_jpeg", "mid_jpeg"):
+        if preferred in cols:
+            return preferred
+    jpeg_cols = [c for c in cols if "jpeg" in c.lower() or "jpg" in c.lower()]
+    if jpeg_cols:
+        return sorted(jpeg_cols)[0]
+    for c in cols:
+        lc = c.lower()
+        if "image" in lc or "photo" in lc:
+            return c
+    return None
 
-    Names are `shot_<id:05d>.jpg` so MegaLoc/COLMAP treats each as a distinct
-    photo. Returns a list of per-file metadata dicts (shot_id, filename,
-    lat, lon, bearing_deg, captured_at) so the web UI can still render GPS,
-    bearing, etc. after the BLOBs are gone.
+
+def _optional_col(cols, *candidates):
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
+
+def extract_snapapp_wide(path: Path, out_dir: Path) -> list:
+    """Extract the 1× wide image BLOB for every shot into `out_dir`.
+
+    Tolerant of schema drift: falls back to mid_jpeg / any *_jpeg column /
+    any image-ish column if `wide_jpeg` isn't present. Per-shot columns
+    (lat, lon, bearing_deg, accuracy_m, captured_at) are looked up by name
+    so missing ones degrade to None rather than failing the whole extract.
     """
     path = Path(path)
     out_dir = Path(out_dir)
@@ -123,14 +194,48 @@ def extract_snapapp_wide(path: Path, out_dir: Path) -> list:
 
     conn = sqlite3.connect(str(path))
     cur = conn.cursor()
+
+    # Find the shots table (case-insensitive) and the best image column
+    shots_table = None
+    for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+        if row[0].lower() == "shots":
+            shots_table = row[0]
+            break
+    if shots_table is None:
+        conn.close()
+        return []
+    img_col = _pick_image_column(cur, shots_table)
+    if img_col is None:
+        conn.close()
+        return []
+
+    cols = _table_columns(cur, shots_table)
+    c_id = _optional_col(cols, "id", "rowid") or "id"
+    c_captured = _optional_col(cols, "captured_at", "timestamp", "ts")
+    c_lat = _optional_col(cols, "lat", "latitude")
+    c_lon = _optional_col(cols, "lon", "lng", "longitude")
+    c_bearing = _optional_col(cols, "bearing_deg", "bearing", "heading_deg", "heading")
+    c_accuracy = _optional_col(cols, "accuracy_m", "accuracy", "horiz_accuracy_m")
+
+    def pick(col):
+        return col if col else "NULL"
+
+    sql = (
+        f'SELECT "{c_id}", {pick(c_captured)}, {pick(c_lat)}, {pick(c_lon)}, '
+        f'{pick(c_bearing)}, {pick(c_accuracy)}, "{img_col}" '
+        f'FROM "{shots_table}" WHERE "{img_col}" IS NOT NULL '
+        f'ORDER BY {pick(c_captured) if c_captured else c_id}'
+    )
+
     results = []
-    for row in cur.execute(
-        "SELECT id, captured_at, lat, lon, bearing_deg, accuracy_m, wide_jpeg "
-        "FROM shots WHERE wide_jpeg IS NOT NULL ORDER BY captured_at"
-    ):
-        sid, captured_at, lat, lon, bearing, acc, wide = row
-        name = f"shot_{sid:05d}.jpg"
-        (out_dir / name).write_bytes(wide)
+    for row in cur.execute(sql):
+        sid, captured_at, lat, lon, bearing, acc, blob = row
+        try:
+            sid_int = int(sid)
+            name = f"shot_{sid_int:05d}.jpg"
+        except Exception:
+            name = f"shot_{sid}.jpg"
+        (out_dir / name).write_bytes(blob)
         results.append({
             "shot_id": sid, "filename": name,
             "lat": lat, "lon": lon,

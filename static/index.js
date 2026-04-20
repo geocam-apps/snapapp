@@ -80,8 +80,9 @@ function formatSize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
 
-// Chunk size well under Cloudflare's 100 MB free-tier body cap.
-const CHUNK_SIZE = 16 * 1024 * 1024;  // 16 MB
+// 8 MB chunks — safely under any plausible CDN body cap, and small enough
+// that a failure early in the upload surfaces fast with a real HTTP response.
+const CHUNK_SIZE = 8 * 1024 * 1024;
 
 function uuid() {
   return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
@@ -91,6 +92,7 @@ function uuid() {
 async function uploadOneFile(file, onProgress) {
   const uploadId = uuid();
   let offset = 0;
+  let chunkIdx = 0;
   while (offset < file.size) {
     const end = Math.min(offset + CHUNK_SIZE, file.size);
     const slice = file.slice(offset, end);
@@ -98,13 +100,24 @@ async function uploadOneFile(file, onProgress) {
     fd.append("upload_id", uploadId);
     fd.append("offset", String(offset));
     fd.append("chunk", slice);
-    const r = await fetch("/api/upload/chunk", {method: "POST", body: fd});
+    let r;
+    try {
+      r = await fetch("/api/upload/chunk", {method: "POST", body: fd});
+    } catch (e) {
+      throw new Error(
+        `network error on chunk ${chunkIdx} (offset ${offset}, ${slice.size} B): ${e.message}`
+      );
+    }
     if (!r.ok) {
-      let msg = r.status + "";
-      try { msg = (await r.json()).error || msg; } catch (e) {}
-      throw new Error(`chunk upload failed: ${msg}`);
+      const body = await r.text().catch(() => "");
+      let parsed = body;
+      try { parsed = JSON.parse(body).error || body; } catch (e) {}
+      throw new Error(
+        `chunk ${chunkIdx} (offset ${offset}, ${slice.size} B) → HTTP ${r.status}: ${parsed.slice(0, 200)}`
+      );
     }
     offset = end;
+    chunkIdx += 1;
     onProgress(offset, file.size);
   }
   return uploadId;
