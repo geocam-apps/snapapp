@@ -13,11 +13,11 @@ from pathlib import Path
 from . import db, paths
 
 
-# MegaLoc's DINOv2 backbone OOM'd on this host; pin it to CPU.
-# shotmatch_pose's DISK + LightGlue path tolerates the GPU fine (and needs
-# it to finish in any reasonable time).
-MEGALOC_ENV = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
-SFM_ENV = os.environ.copy()
+# Both MegaLoc and shotmatch_pose can use the GPU. The GB10's unified-memory
+# CUDA allocator hit a transient OOM on the very first cold MegaLoc load
+# during scaffolding, but that doesn't recur in steady state — a subprocess
+# env is sufficient and CPU is an adequate fallback at ~2 img/s.
+CHILD_ENV = os.environ.copy()
 
 
 # Track in-flight shots: shot_id -> thread
@@ -82,7 +82,7 @@ def run_megaloc_for_project(project_id: str) -> dict:
     ]
     log_append(log_path, f"[megaloc] cmd: {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
-                          env=MEGALOC_ENV)
+                          env=CHILD_ENV)
     log_append(log_path, f"[megaloc] returncode={proc.returncode}")
     log_append(log_path, f"[megaloc] stdout:\n{proc.stdout[-2000:]}")
     if proc.returncode != 0:
@@ -224,7 +224,7 @@ def _process_shot(shot_id: str):
 
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=SFM_ENV,
+            text=True, bufsize=1, env=CHILD_ENV,
         )
 
         phase_map = [
