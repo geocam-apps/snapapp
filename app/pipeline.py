@@ -10,7 +10,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import db, paths
+from . import db, paths, ref_index
 
 
 # Both MegaLoc and shotmatch_pose can use the GPU. The GB10's unified-memory
@@ -76,7 +76,11 @@ def run_megaloc_for_project(project_id: str) -> dict:
         "python3", str(paths.MEGALOC_REPO / "match_photos.py"),
         "--photos", str(photos_dir),
         "--output", str(csv_path),
-        "--top-k", "3",
+        # top-20 instead of the default 3 — phone photos often don't land
+        # in the top-3 on this dataset (different camera, lighting, etc.),
+        # but the correct ref is usually in the top-20 and GPS-filtering
+        # will pull it out.
+        "--top-k", "20",
         "--db", str(paths.MEGALOC_DB),
         "--gcdb-dir", str(paths.MEGALOC_GCDB_DIR),
     ]
@@ -93,44 +97,205 @@ def run_megaloc_for_project(project_id: str) -> dict:
 
 
 def _read_megaloc_csv(csv_path: Path) -> dict:
+    """Parse MegaLoc's top-K CSV into `{photo_stem: {score, shot_key, shot_id,
+    capture, top_k:[…]}}`. Top-1 is mirrored at the root for backward
+    compatibility with earlier API consumers.
+    """
     out = {}
     with open(csv_path) as f:
         rows = list(csv.DictReader(f))
     for r in rows:
         photo_stem = Path(r["photo"]).stem
-        shot_key = r.get("match_1_shot_key", "")
-        capture = None
-        shot_id = shot_key
-        if "/" in shot_key:
-            capture, shot_id = shot_key.rsplit("/", 1)
+        top_k = []
+        for i in range(1, 100):  # supports up to top-99
+            sk = r.get(f"match_{i}_shot_key")
+            if not sk:
+                break
+            score = float(r.get(f"match_{i}_score") or 0.0)
+            capture, shot_id = (sk.rsplit("/", 1)
+                                if "/" in sk else (None, sk))
+            top_k.append({
+                "shot_key": sk, "shot_id": shot_id,
+                "capture": capture, "score": score,
+            })
+        if not top_k:
+            continue
+        best = top_k[0]
         out[photo_stem] = {
             "photo": r["photo"],
-            "shot_key": shot_key,
-            "shot_id": shot_id,
-            "capture": capture,
-            "score": float(r.get("match_1_score") or 0.0),
+            "shot_key": best["shot_key"],
+            "shot_id": best["shot_id"],
+            "capture": best["capture"],
+            "score": best["score"],
+            "top_k": top_k,
         }
     return out
 
 
-def _choose_anchor(matches: dict, photo_stems: list, pinned_stem: str = None) -> tuple:
-    """Given megaloc matches, pick the best-scoring photo stem as anchor.
+def _annotate_matches_with_gps(matches: dict, photo_meta: dict) -> dict:
+    """For each photo's top-K MegaLoc matches, compute the distance from the
+    phone's reported GPS to the reference shot's known lat/lon, and mark
+    which matches fall inside the phone's accuracy radius.
 
-    If `pinned_stem` is supplied (and has a MegaLoc match), use it directly
-    — lets the user override a weak auto-pick.
+    Mutates `matches` in place; returns it for convenience. Does nothing if
+    the ref_index isn't available.
     """
+    idx = ref_index.load()
+    if not idx:
+        return matches
+    for stem, m in matches.items():
+        meta = (photo_meta or {}).get(stem + ".jpg") or {}
+        phone_lat = meta.get("lat")
+        phone_lon = meta.get("lon")
+        accuracy = meta.get("accuracy_m") or 0
+        # Accept within max(15m, 2× accuracy) to cover GPS noise
+        radius_m = max(15.0, 2.0 * (accuracy or 0))
+        m["radius_m"] = radius_m
+        # Cache phone position so _nearest_ref_by_gps doesn't have to
+        # re-walk photo_meta.
+        m["_phone_lat"] = phone_lat
+        m["_phone_lon"] = phone_lon
+        for cand in m["top_k"]:
+            pos = idx.get(cand["shot_key"])
+            if pos is None:
+                cand["ref_lat"] = None
+                cand["ref_lon"] = None
+                cand["distance_m"] = None
+                cand["gps_valid"] = None
+                continue
+            cand["ref_lat"] = pos["lat"]
+            cand["ref_lon"] = pos["lon"]
+            if phone_lat is not None and phone_lon is not None:
+                d = ref_index.haversine_m(phone_lat, phone_lon,
+                                          pos["lat"], pos["lon"])
+                cand["distance_m"] = d
+                cand["gps_valid"] = d <= radius_m
+            else:
+                cand["distance_m"] = None
+                cand["gps_valid"] = None
+        # Best GPS-valid match (if any)
+        gps_ok = [c for c in m["top_k"] if c.get("gps_valid")]
+        if gps_ok:
+            best = max(gps_ok, key=lambda c: c["score"])
+            m["gps_best"] = best
+    return matches
+
+
+def _choose_anchor(matches: dict, photo_stems: list,
+                   pinned_stem: str = None) -> tuple:
+    """Pick (anchor_stem, chosen_match_dict) for the shotmatch_pose subprocess.
+
+    Strategy, in order:
+      1. If `pinned_stem` is given, honor it — use that photo's best
+         GPS-valid match, falling back to its MegaLoc top-1 if none.
+      2. Otherwise, walk every photo's top-K MegaLoc matches, keep only
+         those within the phone's GPS accuracy radius, and pick the one
+         with the highest MegaLoc score. The ref shot in that match becomes
+         the anchor, and the photo it belongs to becomes the anchor photo.
+      3. If no photo has any GPS-valid match, fall back to the best
+         MegaLoc top-1 across all photos and flag `gps_valid=False` so
+         the UI can warn.
+
+    Returns (anchor_stem, {shot_key, shot_id, capture, score, gps_valid,
+                            distance_m, ref_lat, ref_lon, radius_m}).
+    """
+    def _pick_for_photo(stem):
+        m = matches.get(stem)
+        if not m:
+            return None
+        chosen = m.get("gps_best")
+        if chosen:
+            return {**chosen, "gps_valid": True,
+                    "radius_m": m.get("radius_m")}
+        top = m["top_k"][0]
+        return {**top, "gps_valid": top.get("gps_valid"),
+                "radius_m": m.get("radius_m")}
+
     if pinned_stem and pinned_stem in matches:
-        return pinned_stem, matches[pinned_stem]
+        return pinned_stem, _pick_for_photo(pinned_stem)
+
     best = None
     for stem in photo_stems:
         m = matches.get(stem)
-        if m is None:
+        if not m:
             continue
-        if best is None or m["score"] > best[1]["score"]:
-            best = (stem, m)
+        gps_best = m.get("gps_best")
+        if gps_best is None:
+            continue
+        if best is None or gps_best["score"] > best[1]["score"]:
+            best = (stem, {**gps_best, "gps_valid": True,
+                           "radius_m": m.get("radius_m")})
+    if best is not None:
+        return best
+
+    # Fallback 1: no GPS-valid match in any top-K — try pure GPS.
+    # Pick each photo's NEAREST ref shot (from the full ref_index) and
+    # keep the single closest one across all photos. MegaLoc isn't
+    # picking here; geography is.
+    gps_pick = _nearest_ref_by_gps(photo_stems, matches)
+    if gps_pick is not None:
+        return gps_pick
+
+    # Fallback 2: no phone GPS at all — use the best MegaLoc score across
+    # all photos and flag gps_valid=None.
+    for stem in photo_stems:
+        pick = _pick_for_photo(stem)
+        if pick is None:
+            continue
+        if best is None or pick["score"] > best[1]["score"]:
+            best = (stem, pick)
     if best is None:
         raise RuntimeError("No MegaLoc matches for any photo")
     return best
+
+
+def _nearest_ref_by_gps(photo_stems, matches):
+    """Pick (anchor_stem, anchor_info) by finding the closest reference shot
+    to any of the selected photos' reported GPS. Used when MegaLoc top-K
+    misses but the phone's GPS is trustworthy enough to stand on its own.
+
+    Scans the full ref_index; O(n_refs × n_photos) which is fine at the
+    scales we see (12k refs × a few dozen photos).
+    """
+    idx = ref_index.load()
+    if not idx:
+        return None
+    best = None  # (distance, stem, shot_key, pos, radius)
+    for stem in photo_stems:
+        m = matches.get(stem) or {}
+        radius_m = m.get("radius_m") or 15.0
+        # Photo GPS lives on any top-K entry's radius context; but the
+        # phone's actual lat/lon came from photo_meta. Pull it from the
+        # first top-K entry's annotation if available, otherwise skip.
+        # Easier: reach back into matches' annotation by requiring at
+        # least one top-K distance to exist — then reconstruct from
+        # distance + ref pos? No: instead, bail out if we don't have
+        # phone lat/lon cached. We'll get it from _annotate's side-data.
+        phone_lat = m.get("_phone_lat")
+        phone_lon = m.get("_phone_lon")
+        if phone_lat is None or phone_lon is None:
+            continue
+        for shot_key, pos in idx.items():
+            d = ref_index.haversine_m(phone_lat, phone_lon,
+                                      pos["lat"], pos["lon"])
+            if best is None or d < best[0]:
+                best = (d, stem, shot_key, pos, radius_m)
+    if best is None:
+        return None
+    d, stem, shot_key, pos, radius_m = best
+    capture, shot_id = (shot_key.rsplit("/", 1)
+                        if "/" in shot_key else (None, shot_key))
+    return stem, {
+        "shot_key": shot_key,
+        "shot_id": shot_id,
+        "capture": capture,
+        "score": 0.0,               # MegaLoc didn't pick this
+        "gps_valid": d <= radius_m,
+        "distance_m": d,
+        "ref_lat": pos["lat"], "ref_lon": pos["lon"],
+        "radius_m": radius_m,
+        "source": "gps_nearest",
+    }
 
 
 def run_shot(shot_id: str):
@@ -144,6 +309,127 @@ def run_shot(shot_id: str):
     t = threading.Thread(target=_process_shot, args=(shot_id,), daemon=True)
     RUNNING[shot_id] = t
     t.start()
+
+
+def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
+                            anchor_shot_id, anchor_capture, shot_out_dir,
+                            n_shots_neighbours=15):
+    """Multi-photo SFM via register_sequence_natural.py."""
+    cmd = [
+        "python3", "-u",
+        str(paths.SHOTMATCH_REPO / "register_sequence_natural.py"),
+        "--photos-dir", str(staging_dir),
+        "--anchor", f"{anchor_stem}={anchor_shot_id}",
+        "--capture", anchor_capture or "",
+        "--model", str(paths.REF_MODEL_DIR),
+        "--images", str(paths.REF_IMAGES_DIR),
+        "--output", str(shot_out_dir),
+        "--camera-model", "OPENCV",
+        "--n-shots", str(n_shots_neighbours),
+    ]
+    log_append(log_path, f"[sfm] cmd: {' '.join(cmd)}")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=CHILD_ENV,
+    )
+    phase_map = [
+        ("Phase 1:", "phase1", "Registering anchor against refs", 0.20),
+        ("Phase 2:", "sift", "SIFT extract + match", 0.30),
+        ("SIFT extract", "sift", "SIFT feature extraction", 0.35),
+        ("Exhaustive matching", "match", "Matching features", 0.50),
+        ("Phase 3:", "mapper", "Incremental SFM", 0.65),
+        ("Phase 4:", "retry", "Retrying missing photos", 0.80),
+        ("Phase 5:", "align", "Aligning to reference frame", 0.85),
+        ("Phase 6:", "ba", "Global bundle adjustment", 0.90),
+        ("Phase 7:", "extract", "Extracting results", 0.95),
+    ]
+    for line in proc.stdout:
+        line = line.rstrip()
+        log_append(log_path, f"[sfm] {line}")
+        for marker, phase, label, progress in phase_map:
+            if marker in line:
+                db.update_shot(shot_id, phase=phase, phase_label=label,
+                               progress=progress)
+                break
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"SFM failed (returncode={proc.returncode})")
+
+
+def _run_register_photo(shot_id, log_path, photo_path, anchor_stem,
+                         anchor_shot_id, anchor_capture, shot_out_dir):
+    """Single-photo PnP via register_photo.py.
+
+    That script doesn't emit phase markers like the sequence pipeline, so
+    we run it to completion then synthesize a `sequence.json` compatible
+    with the viewer. Copies the query image into `shot_out_dir/images/` so
+    the three.js scene endpoint can serve it.
+    """
+    cmd = [
+        "python3", "-u", str(paths.SHOTMATCH_REPO / "register_photo.py"),
+        "--photo", str(photo_path),
+        "--model", str(paths.REF_MODEL_DIR),
+        "--images", str(paths.REF_IMAGES_DIR),
+        "--matched-shot", anchor_shot_id,
+        "--capture", anchor_capture or "",
+        "--output", str(shot_out_dir),
+        "--n-shots", "10",
+    ]
+    log_append(log_path, f"[sfm] cmd: {' '.join(cmd)}")
+    db.update_shot(shot_id, phase="phase1",
+                   phase_label="Registering photo via PnP", progress=0.30)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=CHILD_ENV,
+    )
+    for line in proc.stdout:
+        log_append(log_path, f"[sfm] {line.rstrip()}")
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"register_photo failed (returncode={proc.returncode})")
+
+    # register_photo.py writes the query JPEG at <stem>.jpg alongside the
+    # sidecar. The viewer expects output/images/<stem>.jpg, so move it there.
+    sidecar_path = shot_out_dir / f"{anchor_stem}_pose.json"
+    img_src = shot_out_dir / f"{anchor_stem}.jpg"
+    if img_src.exists():
+        images_dir = shot_out_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        shutil.move(str(img_src), str(images_dir / f"{anchor_stem}.jpg"))
+
+    pose = {}
+    if sidecar_path.exists():
+        with open(sidecar_path) as f:
+            pose = json.load(f)
+
+    # Compose a sequence.json so the viewer + status endpoint can find it.
+    sequence = {
+        "sequence_name": Path(shot_out_dir).name,
+        "method": "register_photo.py (single-photo PnP vs ref-triangulated)",
+        "n_queries": 1,
+        "n_registered": 1 if pose else 0,
+        "failed": [] if pose else [anchor_stem],
+        "anchors": {anchor_stem: {
+            "shot_id": anchor_shot_id,
+            "capture": anchor_capture,
+        }},
+        "queries": [{
+            "stem": anchor_stem,
+            "image_name": f"query/{anchor_stem}.jpg",
+            "qvec": pose.get("qvec"),
+            "tvec": pose.get("tvec"),
+            "center_world": pose.get("center_world"),
+            "num_observations": pose.get("num_observations"),
+            "num_points2D": pose.get("num_points2D"),
+            "latlon": pose.get("latlon"),
+        }] if pose else [],
+    }
+    with open(shot_out_dir / "sequence.json", "w") as f:
+        json.dump(sequence, f, indent=2)
+
+    if not pose:
+        raise RuntimeError("register_photo completed but no pose sidecar "
+                           "was produced")
 
 
 def _process_shot(shot_id: str):
@@ -177,6 +463,11 @@ def _process_shot(shot_id: str):
         db.update_shot(shot_id, phase="megaloc", phase_label="Running MegaLoc", progress=0.05)
         log_append(log_path, "[megaloc] running...")
         matches = run_megaloc_for_project(project["id"])
+        # GPS-annotate the top-K matches so _choose_anchor can filter by
+        # proximity to the phone's reported position.
+        project_meta = project.get("meta") or {}
+        photo_meta = project_meta.get("photo_meta") or {}
+        _annotate_matches_with_gps(matches, photo_meta)
         log_append(log_path, f"[megaloc] got {len(matches)} matches total")
 
         anchor_stem, anchor_info = _choose_anchor(
@@ -185,14 +476,21 @@ def _process_shot(shot_id: str):
         anchor_shot_id = anchor_info["shot_id"]
         anchor_capture = anchor_info["capture"]
         anchor_score = anchor_info["score"]
-        log_append(log_path, f"[megaloc] anchor: {anchor_stem} -> {anchor_info['shot_key']} "
-                              f"(score={anchor_score:.3f})")
+        gps_note = ""
+        if anchor_info.get("distance_m") is not None:
+            gps_note = (f" GPS_d={anchor_info['distance_m']:.0f}m"
+                        f" within={anchor_info.get('gps_valid')}")
+        log_append(log_path, f"[megaloc] anchor: {anchor_stem} -> "
+                              f"{anchor_info['shot_key']} "
+                              f"(score={anchor_score:.3f}{gps_note})")
         db.update_shot(
             shot_id, anchor_shot=anchor_shot_id, anchor_score=anchor_score,
             progress=0.10,
             meta={**meta, "anchor_stem": anchor_stem,
                   "anchor_shot_key": anchor_info["shot_key"],
                   "anchor_capture": anchor_capture,
+                  "anchor_distance_m": anchor_info.get("distance_m"),
+                  "anchor_gps_valid": anchor_info.get("gps_valid"),
                   "n_photos": len(photo_files)},
         )
 
@@ -205,49 +503,24 @@ def _process_shot(shot_id: str):
         for p in photo_files:
             shutil.copy(p, staging_dir / p.name)
 
-        # Step 3: Run register_sequence_natural.py
+        # Step 3: branch on photo count — single-photo shots go through
+        # register_photo.py (PnP against the ref-triangulated scene);
+        # multi-photo shots go through register_sequence_natural.py.
         db.update_shot(shot_id, phase="sfm", phase_label="Preparing SFM",
                        progress=0.15, n_queries=len(photo_files))
-        n_shots = int(meta.get("n_shots") or 15)
-        cmd = [
-            "python3", "-u", str(paths.SHOTMATCH_REPO / "register_sequence_natural.py"),
-            "--photos-dir", str(staging_dir),
-            "--anchor", f"{anchor_stem}={anchor_shot_id}",
-            "--capture", anchor_capture or "",
-            "--model", str(paths.REF_MODEL_DIR),
-            "--images", str(paths.REF_IMAGES_DIR),
-            "--output", str(shot_out_dir),
-            "--camera-model", "OPENCV",
-            "--n-shots", str(n_shots),
-        ]
-        log_append(log_path, f"[sfm] cmd: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=CHILD_ENV,
-        )
-
-        phase_map = [
-            ("Phase 1:", "phase1", "Registering anchor against refs", 0.20),
-            ("Phase 2:", "sift", "SIFT extract + match", 0.30),
-            ("SIFT extract", "sift", "SIFT feature extraction", 0.35),
-            ("Exhaustive matching", "match", "Matching features", 0.50),
-            ("Phase 3:", "mapper", "Incremental SFM", 0.65),
-            ("Phase 4:", "retry", "Retrying missing photos", 0.80),
-            ("Phase 5:", "align", "Aligning to reference frame", 0.85),
-            ("Phase 6:", "ba", "Global bundle adjustment", 0.90),
-            ("Phase 7:", "extract", "Extracting results", 0.95),
-        ]
-        for line in proc.stdout:
-            line = line.rstrip()
-            log_append(log_path, f"[sfm] {line}")
-            for marker, phase, label, progress in phase_map:
-                if marker in line:
-                    db.update_shot(shot_id, phase=phase, phase_label=label, progress=progress)
-                    break
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(f"SFM failed (returncode={proc.returncode})")
+        if len(photo_files) == 1:
+            anchor_photo = staging_dir / photo_files[0].name
+            _run_register_photo(
+                shot_id, log_path, anchor_photo, anchor_stem,
+                anchor_shot_id, anchor_capture, shot_out_dir,
+            )
+        else:
+            _run_register_sequence(
+                shot_id, log_path, staging_dir, anchor_stem,
+                anchor_shot_id, anchor_capture, shot_out_dir,
+                n_shots_neighbours=int(meta.get("n_shots") or 15),
+            )
 
         summary_path = shot_out_dir / "sequence.json"
         if not summary_path.exists():

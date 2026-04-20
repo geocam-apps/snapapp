@@ -110,13 +110,24 @@ def api_project(project_id):
     if sqlite_path is not None and sqlite_path.exists():
         p["sqlite"] = gcdb_read.probe_gcdb(sqlite_path)
         p["sqlite"]["poses_sample"] = gcdb_read.list_poses(sqlite_path, limit=50)
-    # Include MegaLoc matches if available
+    # Include MegaLoc matches if available, GPS-annotated against the phone's
+    # reported lat/lon so the UI can show distance badges.
     csv_path = paths.project_megaloc_csv(project_id)
     p["megaloc_ready"] = csv_path.exists()
     p["megaloc_running"] = project_id in pipeline.MEGALOC_RUNNING
     if csv_path.exists():
         try:
-            p["megaloc_matches"] = pipeline._read_megaloc_csv(csv_path)
+            matches = pipeline._read_megaloc_csv(csv_path)
+            pipeline._annotate_matches_with_gps(
+                matches, (p.get("meta") or {}).get("photo_meta") or {},
+            )
+            # Drop the leading-underscore internals (_phone_lat/_phone_lon)
+            # from the API payload — they're only for pipeline internal use.
+            for m in matches.values():
+                for k in list(m.keys()):
+                    if k.startswith("_"):
+                        del m[k]
+            p["megaloc_matches"] = matches
         except Exception:
             p["megaloc_matches"] = {}
     return jsonify(p)
@@ -748,13 +759,8 @@ def api_run_shot(shot_id):
     if shot["status"] == "running":
         return jsonify({"ok": True, "already_running": True})
     stems = (shot.get("meta") or {}).get("photo_stems") or []
-    if len(stems) < 2:
-        return jsonify({
-            "error": (
-                f"Shot has {len(stems)} photo(s); sequence SFM needs at least "
-                "two overlapping views. Pick more photos and create a new shot."
-            ),
-        }), 400
+    if not stems:
+        return jsonify({"error": "Shot has no photos."}), 400
     pipeline.run_shot(shot_id)
     return jsonify({"ok": True})
 

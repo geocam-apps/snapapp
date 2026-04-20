@@ -112,30 +112,31 @@ function renderShots(shots) {
     const shot = (latestProject?.shots || []).find(s => s.id === id);
     const mm = latestProject?.megaloc_matches || {};
     const stems = shot?.meta?.photo_stems || [];
-    // Sequence SFM needs ≥ 2 overlapping views — Phase 3 mapper fails
-    // instantly with "No images with matches found" on a single query.
-    if (stems.length < 2) {
-      alert(
-        `This shot has only ${stems.length} photo${stems.length === 1 ? "" : "s"}.\n\n` +
-        `Sequence SFM needs at least 2 overlapping views to triangulate ` +
-        `3D points. Pick a cluster of nearby photos (usually 4+) and create ` +
-        `a new shot from the selection.`
-      );
-      return;
-    }
-    // Warn before burning SFM time on a shot whose best anchor is in the
-    // MegaLoc noise band (< 0.15). It'll fail in Phase 1 every time.
-    let bestScore = -1, bestStem = null;
+    // No early block on single-photo shots anymore — the pipeline branches
+    // to register_photo.py (PnP against the ref-triangulated scene) for
+    // those. Only warn if the best anchor is GPS-far and score-weak.
+    // Find the best per-photo candidate, preferring GPS-valid picks.
+    let bestScore = -1, bestStem = null, bestGpsValid = null, bestDist = null;
     for (const ps of stems) {
-      if (mm[ps] && mm[ps].score > bestScore) {
-        bestScore = mm[ps].score; bestStem = ps;
+      const m = mm[ps];
+      if (!m) continue;
+      const cand = m.gps_best || m;
+      if (cand.score > bestScore) {
+        bestScore = cand.score; bestStem = ps;
+        bestGpsValid = m.gps_best ? true : (cand.gps_valid ?? null);
+        bestDist = cand.distance_m ?? null;
       }
     }
-    if (bestScore >= 0 && bestScore < 0.15) {
-      const msg = `Best MegaLoc score in this shot is ${bestScore.toFixed(3)} (${bestStem}).\n\n` +
-        `Scores below 0.15 are in the noise band — the reference FAISS index ` +
-        `likely doesn't cover this location, and SFM will almost certainly fail ` +
-        `in Phase 1.\n\nRun anyway?`;
+    // Warn if the pick is either weak MegaLoc or far from the phone's GPS.
+    const looksBad = (bestScore >= 0 && bestScore < 0.15)
+                   || (bestGpsValid === false);
+    if (looksBad) {
+      const bits = [`Best anchor: ${bestStem} (MegaLoc score ${bestScore.toFixed(3)})`];
+      if (bestDist != null) bits.push(`distance from phone GPS: ${Math.round(bestDist)} m`);
+      if (bestGpsValid === false) bits.push(`— outside the phone's GPS accuracy radius`);
+      if (bestScore < 0.15) bits.push(`— below the 0.15 MegaLoc noise threshold`);
+      const msg = bits.join("\n") +
+        `\n\nSFM is likely to fail. Run anyway?`;
       if (!confirm(msg)) return;
     }
     b.disabled = true;
@@ -214,9 +215,20 @@ function renderPhotos(photos, megalocMatches, photoMeta) {
     th.className = "th";
     th.dataset.stem = stem;
     if (selected.has(stem)) th.classList.add("selected");
+    // Pick the best match to display: prefer the GPS-valid one if we have
+    // any, else fall back to the MegaLoc top-1 (what `match` already is).
+    const displayMatch = (match && match.gps_best) || match;
     const scoreBadge = match
-      ? `<div class="score ${scoreClass(match.score)}" title="${escapeHtml(match.shot_key)}">${match.score.toFixed(2)}</div>`
+      ? `<div class="score ${scoreClass(displayMatch.score)}" title="${escapeHtml(displayMatch.shot_key || "")}">${displayMatch.score.toFixed(2)}</div>`
       : "";
+    // Distance badge: how far the picked ref shot is from the phone's GPS.
+    let gpsBadge = "";
+    if (displayMatch && displayMatch.distance_m != null) {
+      const d = displayMatch.distance_m;
+      const cls = displayMatch.gps_valid ? "gps-ok" : "gps-far";
+      const label = d < 1000 ? `${Math.round(d)} m` : `${(d/1000).toFixed(1)} km`;
+      gpsBadge = `<div class="gps-dist ${cls}" title="distance from phone GPS to ref shot">${label}</div>`;
+    }
     const gpsLine = meta && meta.lat != null && meta.lon != null
       ? `<div class="gps">${meta.lat.toFixed(5)},${meta.lon.toFixed(5)}${
            meta.bearing_deg != null ? ` · ${Math.round(meta.bearing_deg)}°` : ""}</div>`
@@ -224,6 +236,7 @@ function renderPhotos(photos, megalocMatches, photoMeta) {
     th.innerHTML = `
       <img src="/api/projects/${PROJECT_ID}/photo/${encodeURIComponent(name)}" loading="lazy">
       ${scoreBadge}
+      ${gpsBadge}
       <div class="lbl">${escapeHtml(name)}${gpsLine}</div>
     `;
     th.addEventListener("click", () => {
