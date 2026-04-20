@@ -80,50 +80,80 @@ function formatSize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
 
+// Chunk size well under Cloudflare's 100 MB free-tier body cap.
+const CHUNK_SIZE = 16 * 1024 * 1024;  // 16 MB
+
+function uuid() {
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
+}
+
+async function uploadOneFile(file, onProgress) {
+  const uploadId = uuid();
+  let offset = 0;
+  while (offset < file.size) {
+    const end = Math.min(offset + CHUNK_SIZE, file.size);
+    const slice = file.slice(offset, end);
+    const fd = new FormData();
+    fd.append("upload_id", uploadId);
+    fd.append("offset", String(offset));
+    fd.append("chunk", slice);
+    const r = await fetch("/api/upload/chunk", {method: "POST", body: fd});
+    if (!r.ok) {
+      let msg = r.status + "";
+      try { msg = (await r.json()).error || msg; } catch (e) {}
+      throw new Error(`chunk upload failed: ${msg}`);
+    }
+    offset = end;
+    onProgress(offset, file.size);
+  }
+  return uploadId;
+}
+
 uploadBtn.addEventListener("click", async () => {
   const kind = getKind();
   const name = document.getElementById("projName").value.trim();
-  const fd = new FormData();
-  if (name) fd.append("name", name);
-  if (kind === "sqlite") {
-    fd.append("sqlite", pendingFiles[0]);
-  } else {
-    for (const f of pendingFiles) fd.append("photos", f);
-  }
 
   uploadBtn.disabled = true;
-  uploadStatus.innerHTML = `<div>Uploading ${pendingFiles.length} file(s)...</div>
+  const totalBytes = pendingFiles.reduce((s, f) => s + f.size, 0);
+  let doneBytes = 0;
+  uploadStatus.innerHTML = `<div id="upMsg">Uploading ${pendingFiles.length} file(s) (${formatSize(totalBytes)})...</div>
     <div class="progress"><div id="uploadBar" style="width:0%"></div></div>`;
   const bar = document.getElementById("uploadBar");
+  const msgEl = document.getElementById("upMsg");
 
-  const xhr = new XMLHttpRequest();
-  xhr.open("POST", "/api/upload");
-  xhr.upload.addEventListener("progress", (e) => {
-    if (e.lengthComputable) {
-      bar.style.width = (e.loaded / e.total * 100).toFixed(1) + "%";
+  try {
+    const uploaded = [];
+    for (let i = 0; i < pendingFiles.length; i++) {
+      const f = pendingFiles[i];
+      msgEl.textContent = `Uploading ${i + 1}/${pendingFiles.length}: ${f.name} (${formatSize(f.size)})`;
+      const startedAt = doneBytes;
+      const uploadId = await uploadOneFile(f, (sent, total) => {
+        const cur = startedAt + sent;
+        bar.style.width = (cur / totalBytes * 100).toFixed(1) + "%";
+      });
+      doneBytes += f.size;
+      uploaded.push({upload_id: uploadId, filename: f.name});
     }
-  });
-  xhr.onload = () => {
-    if (xhr.status >= 200 && xhr.status < 300) {
-      try {
-        const data = JSON.parse(xhr.responseText);
-        uploadStatus.innerHTML = `<div style="color:#065f46">Uploaded. Redirecting...</div>`;
-        setTimeout(() => { location.href = `/project/${data.project_id}`; }, 400);
-      } catch (e) {
-        uploadStatus.innerHTML = `<div style="color:#991b1b">Error: ${e}</div>`;
-      }
-    } else {
-      let msg = xhr.responseText;
-      try { msg = JSON.parse(xhr.responseText).error || msg; } catch (e) {}
-      uploadStatus.innerHTML = `<div style="color:#991b1b">Upload failed: ${msg}</div>`;
-      uploadBtn.disabled = false;
+
+    msgEl.textContent = `Finalizing...`;
+    const finalRes = await fetch("/api/upload/finalize", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({name, kind, files: uploaded}),
+    });
+    if (!finalRes.ok) {
+      let msg = finalRes.status + "";
+      try { msg = (await finalRes.json()).error || msg; } catch (e) {}
+      throw new Error(`finalize failed: ${msg}`);
     }
-  };
-  xhr.onerror = () => {
-    uploadStatus.innerHTML = `<div style="color:#991b1b">Upload failed</div>`;
+    const data = await finalRes.json();
+    uploadStatus.innerHTML = `<div style="color:#065f46">Uploaded. Redirecting...</div>`;
+    setTimeout(() => { location.href = `/project/${data.project_id}`; }, 400);
+  } catch (e) {
+    uploadStatus.innerHTML = `<div style="color:#991b1b">Upload failed: ${e.message}</div>`;
     uploadBtn.disabled = false;
-  };
-  xhr.send(fd);
+  }
 });
 
 // Projects list

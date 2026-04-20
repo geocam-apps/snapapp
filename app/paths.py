@@ -28,8 +28,26 @@ def project_photos_dir(project_id: str) -> Path:
     return d
 
 
-def project_sqlite_path(project_id: str) -> Path:
-    return project_dir(project_id) / "upload.gcdb"
+SQLITE_EXTS = (".db", ".sqlite", ".sqlite3", ".gcdb")
+
+
+def project_sqlite_path(project_id: str) -> Path | None:
+    """Return the uploaded sqlite path if present, regardless of extension."""
+    d = project_dir(project_id)
+    for ext in SQLITE_EXTS:
+        p = d / f"upload{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def new_project_sqlite_path(project_id: str, original_filename: str) -> Path:
+    """Decide where to store an uploaded sqlite — preserves the user's extension
+    so they see something familiar in logs. Defaults to .db."""
+    ext = Path(original_filename).suffix.lower()
+    if ext not in SQLITE_EXTS:
+        ext = ".db"
+    return project_dir(project_id) / f"upload{ext}"
 
 
 def project_megaloc_csv(project_id: str) -> Path:

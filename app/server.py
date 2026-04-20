@@ -84,7 +84,7 @@ def api_project(project_id):
     p["photos"] = photos
     # If sqlite, include probe info
     sqlite_path = paths.project_sqlite_path(project_id)
-    if sqlite_path.exists():
+    if sqlite_path is not None and sqlite_path.exists():
         p["sqlite"] = gcdb_read.probe_gcdb(sqlite_path)
         p["sqlite"]["poses_sample"] = gcdb_read.list_poses(sqlite_path, limit=50)
     # Include MegaLoc matches if available
@@ -111,6 +111,122 @@ def api_project_delete(project_id):
     return jsonify({"ok": True})
 
 
+# ---------------------------------------------------------------------------
+# Chunked upload (bypasses Cloudflare's 100 MB request body cap)
+# ---------------------------------------------------------------------------
+
+CHUNK_UPLOADS_DIR = paths.DATA_DIR / "uploads_partial"
+CHUNK_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _chunk_path(upload_id: str) -> Path:
+    # Keep the ID opaque but filesystem-safe
+    safe = "".join(c for c in upload_id if c.isalnum() or c in "-_")
+    if not safe or safe != upload_id:
+        abort(400, "bad upload id")
+    return CHUNK_UPLOADS_DIR / safe
+
+
+@app.route("/api/upload/chunk", methods=["POST"])
+def api_upload_chunk():
+    """Append one chunk to a partial upload.
+
+    Form fields:
+      upload_id: opaque client-generated id (uuid)
+      offset:    byte offset this chunk starts at (must equal current size)
+      chunk:     binary blob
+    """
+    import uuid
+    upload_id = request.form.get("upload_id") or ""
+    try:
+        offset = int(request.form.get("offset") or "0")
+    except ValueError:
+        return jsonify({"error": "bad offset"}), 400
+    chunk = request.files.get("chunk")
+    if not chunk:
+        return jsonify({"error": "no chunk"}), 400
+
+    path = _chunk_path(upload_id)
+    existing = path.stat().st_size if path.exists() else 0
+    if offset != existing:
+        return jsonify({
+            "error": "offset mismatch",
+            "expected": existing, "got": offset,
+        }), 409
+    # Append
+    with open(path, "ab") as f:
+        chunk.save(f)
+    return jsonify({"upload_id": upload_id, "size": path.stat().st_size})
+
+
+@app.route("/api/upload/finalize", methods=["POST"])
+def api_upload_finalize():
+    """Consume one or more completed partial uploads into a new project.
+
+    JSON body:
+      name: optional project name
+      kind: "images" | "sqlite"
+      files: [{upload_id, filename}]  // order matters for display
+    """
+    import shutil as _sh
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    kind = (data.get("kind") or "").strip()
+    files = data.get("files") or []
+    if kind not in ("images", "sqlite"):
+        return jsonify({"error": "bad kind"}), 400
+    if not files:
+        return jsonify({"error": "no files"}), 400
+    if kind == "sqlite" and len(files) != 1:
+        return jsonify({"error": "sqlite upload takes exactly one file"}), 400
+
+    # Validate all partials exist before we create the project
+    for f in files:
+        p = _chunk_path(f.get("upload_id") or "")
+        if not p.exists():
+            return jsonify({"error": f"missing chunk {f.get('upload_id')}"}), 400
+
+    default_name = (Path(files[0]["filename"]).stem if kind == "sqlite"
+                    else f"{len(files)} photos")
+    pid = db.create_project(name or default_name, kind, meta={})
+
+    if kind == "sqlite":
+        src = _chunk_path(files[0]["upload_id"])
+        dst = paths.new_project_sqlite_path(pid, files[0].get("filename") or "upload.db")
+        _sh.move(str(src), str(dst))
+        probe = gcdb_read.probe_gcdb(dst)
+        return jsonify({"project_id": pid, "kind": kind, "sqlite": probe})
+
+    photos_dir = paths.project_photos_dir(pid)
+    saved = []
+    for f in files:
+        filename = Path(f.get("filename") or "").name
+        ext = Path(filename).suffix
+        if ext not in PHOTO_EXTS:
+            continue
+        dst = photos_dir / filename
+        i = 1
+        while dst.exists():
+            dst = photos_dir / f"{dst.stem}_{i}{dst.suffix}"
+            i += 1
+        src = _chunk_path(f["upload_id"])
+        _sh.move(str(src), str(dst))
+        saved.append(dst.name)
+
+    if not saved:
+        _sh.rmtree(paths.project_dir(pid), ignore_errors=True)
+        db.delete_project(pid)
+        return jsonify({"error": "No valid photo files (need HEIC/JPG/PNG)"}), 400
+
+    photo_stems = [Path(n).stem for n in saved]
+    db.create_shot(
+        pid, name="All photos (default)",
+        meta={"photo_stems": photo_stems, "photo_names": saved},
+    )
+    pipeline.start_megaloc_prematch(pid)
+    return jsonify({"project_id": pid, "kind": kind, "n_photos": len(saved)})
+
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     """Create a new project. Accepts photos[] (image sequence) OR sqlite file."""
@@ -134,10 +250,9 @@ def api_upload():
     pid = db.create_project(name or default_name, kind, meta={})
 
     if sqlite_file:
-        dst = paths.project_sqlite_path(pid)
+        dst = paths.new_project_sqlite_path(pid, sqlite_file.filename or "upload.db")
         sqlite_file.save(str(dst))
         probe = gcdb_read.probe_gcdb(dst)
-        db.update_shot  # noop
         return jsonify({"project_id": pid, "kind": kind, "sqlite": probe})
 
     photos_dir = paths.project_photos_dir(pid)
