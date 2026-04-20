@@ -3,9 +3,10 @@ import json
 import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 
-from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file, send_from_directory
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path.home() / "shotmatch_pose"))
@@ -46,23 +47,31 @@ def _no_cache_static(resp):
 PHOTO_EXTS = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".HEIC", ".HEIF", ".JPG", ".JPEG", ".PNG"}
 
 
+ASSET_VERSION = str(int(time.time()))
+
+
+@app.context_processor
+def _inject_asset_version():
+    return {"v": ASSET_VERSION}
+
+
 @app.route("/")
 def index():
-    return send_file(TEMPLATES_DIR / "index.html")
+    return render_template("index.html", v=ASSET_VERSION)
 
 
 @app.route("/project/<project_id>")
 def project_page(project_id):
     if db.get_project(project_id) is None:
         abort(404)
-    return send_file(TEMPLATES_DIR / "project.html")
+    return render_template("project.html", v=ASSET_VERSION)
 
 
 @app.route("/shot/<project_id>/<shot_id>")
 def shot_viewer(project_id, shot_id):
     if db.get_shot(shot_id) is None:
         abort(404)
-    return send_file(TEMPLATES_DIR / "viewer.html")
+    return render_template("viewer.html", v=ASSET_VERSION)
 
 
 # ---------------------------------------------------------------------------
