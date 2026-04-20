@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snapapp — project</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header>
+  <a href="/" class="back">&larr; projects</a>
+  <h1 id="projTitle">Project</h1>
+  <div class="tag" id="projTag"></div>
+</header>
+
+<main>
+  <section class="shots">
+    <div class="row">
+      <h2>Shots</h2>
+      <button id="newShotBtn" class="small">+ New shot from selection</button>
+    </div>
+    <div id="shotsList"></div>
+  </section>
+
+  <section class="photos">
+    <h2>Uploaded photos</h2>
+    <div class="sel-hint">Tap a photo to select it, then use "New shot" to run a sub-sequence.</div>
+    <div id="photosGrid" class="thumb-grid"></div>
+  </section>
+
+  <section class="sqlite" id="sqliteSection" style="display:none">
+    <h2>SQLite contents</h2>
+    <div id="sqliteInfo"></div>
+  </section>
+
+  <section class="danger">
+    <button id="deleteProjectBtn" class="danger">Delete project</button>
+  </section>
+</main>
+
+<script>window.PROJECT_ID = location.pathname.split("/")[2];</script>
+<script src="/static/project.js"></script>
+</body>
+</html>

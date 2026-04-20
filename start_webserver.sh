@@ -1,6 +1,5 @@
 #!/bin/sh
-
-# This is the entrypoint for running the web app
-# Blank to start with, claude can add based on what framework used
-# Make sure web server listens to :8080, as that is what the cloudflare tunnel will point to
-
+# Entrypoint: runs the snapapp Flask server on port 8080.
+cd "$(dirname "$0")"
+export PYTHONPATH="$(pwd):$PYTHONPATH"
+exec python3 -m app.server --port 8080 --host 0.0.0.0 "$@"

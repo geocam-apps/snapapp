@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snapapp — projects</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header>
+  <h1>snapapp</h1>
+  <div class="tag">photo → pose via MegaLoc + COLMAP</div>
+</header>
+
+<main>
+  <section class="upload">
+    <h2>New project</h2>
+    <div class="uploader" id="uploader">
+      <label class="fld">
+        <span>Project name (optional)</span>
+        <input type="text" id="projName" placeholder="e.g. Manhattan Beach walk">
+      </label>
+
+      <div class="choices">
+        <label class="choice">
+          <input type="radio" name="kind" value="images" checked>
+          <span>Image sequence (HEIC / JPG / PNG)</span>
+        </label>
+        <label class="choice">
+          <input type="radio" name="kind" value="sqlite">
+          <span>GCDB SQLite file</span>
+        </label>
+      </div>
+
+      <div class="drop" id="drop">
+        <input type="file" id="fileInput" multiple hidden>
+        <div class="drop-hint">
+          Drag &amp; drop files here, or <a href="#" id="pickBtn">click to browse</a>
+        </div>
+        <div class="drop-files" id="dropFiles"></div>
+      </div>
+
+      <button id="uploadBtn" disabled>Upload</button>
+      <div id="uploadStatus"></div>
+    </div>
+  </section>
+
+  <section class="projects">
+    <h2>Projects</h2>
+    <div id="projectList" class="cards"></div>
+  </section>
+</main>
+
+<script src="/static/index.js"></script>
+</body>
+</html>

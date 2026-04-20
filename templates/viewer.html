@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snapapp — 3D viewer</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  body { background: #0a0a0f; color: #ddd; margin: 0; overflow: hidden; }
+  header { background: #15151c; border-bottom: 1px solid #2a2a35; padding: 8px 16px;
+           display: flex; align-items: center; gap: 16px; }
+  header .back { color: #6cc7ff; text-decoration: none; font-size: 13px; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 500; }
+  header .tag { font-size: 12px; color: #888; }
+  #container { display: flex; height: calc(100vh - 44px); }
+  #sidebar { width: 300px; background: #15151c; border-right: 1px solid #2a2a35;
+             padding: 12px 16px; overflow: auto; }
+  #sidebar .cam { padding: 6px 8px; cursor: pointer; border-radius: 4px; font-size: 12px; }
+  #sidebar .cam:hover { background: #1a1a24; }
+  #sidebar .cam.active { background: #1e2a42; }
+  #sidebar .cam.query { color: #ffcc33; }
+  #sidebar .cam.anchor { color: #ff6677; font-weight: bold; }
+  #sidebar .sep { color: #777; font-size: 10px; text-transform: uppercase;
+                 margin: 8px 0 4px; letter-spacing: 0.5px; border-top: 1px solid #2a2a35;
+                 padding-top: 6px; }
+  #viewer { flex: 1; position: relative; }
+  #canvas { width: 100%; height: 100%; display: block; }
+  .hud { position: absolute; bottom: 10px; left: 10px; font-size: 11px;
+         background: rgba(0,0,0,0.6); padding: 6px 10px; border-radius: 3px; color: #aaa; }
+  .hud b { color: #fff; }
+  .controls { padding: 10px 16px; border-top: 1px solid #2a2a35; font-size: 12px;
+              position: absolute; top: 10px; right: 10px; background: rgba(20,20,28,0.9);
+              border-radius: 6px; }
+  .controls label { display: block; margin: 4px 0; cursor: pointer; user-select: none; }
+  .controls input[type=checkbox] { margin-right: 6px; vertical-align: middle; }
+  .controls input[type=range] { width: 120px; vertical-align: middle; }
+  #sidebar .summary { font-size: 12px; color: #aaa; margin-bottom: 12px; line-height: 1.5; }
+  #sidebar .summary .v { color: #fff; }
+</style>
+</head>
+<body>
+
+<header>
+  <a class="back" id="backLink" href="#">&larr; back</a>
+  <h1 id="shotTitle">Scene</h1>
+  <div class="tag" id="shotTag"></div>
+</header>
+
+<div id="container">
+  <div id="sidebar">
+    <div class="summary" id="summary">Loading...</div>
+    <div class="sep">Cameras</div>
+    <div id="camList"></div>
+  </div>
+  <div id="viewer">
+    <canvas id="canvas"></canvas>
+    <div class="controls">
+      <label><input type="checkbox" id="showPoints" checked> 3D points</label>
+      <label><input type="checkbox" id="showRefFrustums" checked> Ref frustums</label>
+      <label><input type="checkbox" id="showRefImages"> Ref image billboards</label>
+      <label><input type="checkbox" id="showQueryImages" checked> Query billboards</label>
+      <label>Depth <input type="range" id="frustumDepth" min="0.5" max="10" step="0.5" value="3"></label>
+    </div>
+    <div class="hud">
+      <b>Drag</b> rotate &middot; <b>Right-drag</b> pan &middot; <b>Scroll</b> zoom &middot;
+      <b>Click cam</b> focus
+    </div>
+  </div>
+</div>
+
+<script>
+  const parts = location.pathname.split("/");
+  window.PROJECT_ID = parts[2];
+  window.SHOT_ID = parts[3];
+</script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/three/three.module.js",
+    "three/addons/controls/OrbitControls.js": "/static/three/OrbitControls.js"
+  }
+}
+</script>
+<script type="module" src="/static/viewer.js"></script>
+</body>
+</html>

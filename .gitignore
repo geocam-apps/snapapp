@@ -1,0 +1,11 @@
+# Runtime state — not committed
+data/
+*.pyc
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
