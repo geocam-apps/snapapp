@@ -26,6 +26,14 @@
   <section class="photos">
     <h2>Uploaded photos</h2>
     <div class="sel-hint">Tap a photo to select it, then use "New shot" to run a sub-sequence.</div>
+    <div class="legend">
+      MegaLoc score:
+      <span class="score-pill score-high">≥ 0.50 high</span>
+      <span class="score-pill score-ok">≥ 0.30 good</span>
+      <span class="score-pill score-weak">≥ 0.15 weak</span>
+      <span class="score-pill score-bad">&lt; 0.15 noise</span>
+      <span class="legend-note">— scores below 0.15 mean the ref FAISS index doesn't cover this location; SFM will fail.</span>
+    </div>
     <div id="photosGrid" class="thumb-grid"></div>
   </section>
 

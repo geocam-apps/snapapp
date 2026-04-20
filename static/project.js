@@ -5,6 +5,7 @@ const PROJECT_ID = window.PROJECT_ID;
 const selected = new Set();
 
 let latestProject = null;
+const openLogs = new Set();
 
 async function loadProject() {
   const r = await fetch(`/api/projects/${PROJECT_ID}`);
@@ -84,6 +85,24 @@ function renderShots(shots) {
 
   host.querySelectorAll(".btn-run").forEach(b => b.addEventListener("click", async () => {
     const id = b.dataset.id;
+    // Warn before burning SFM time on a shot whose best anchor is in the
+    // MegaLoc noise band (< 0.15). It'll fail in Phase 1 every time.
+    const shot = (latestProject?.shots || []).find(s => s.id === id);
+    const mm = latestProject?.megaloc_matches || {};
+    const stems = shot?.meta?.photo_stems || [];
+    let bestScore = -1, bestStem = null;
+    for (const s of stems) {
+      if (mm[s] && mm[s].score > bestScore) {
+        bestScore = mm[s].score; bestStem = s;
+      }
+    }
+    if (bestScore >= 0 && bestScore < 0.15) {
+      const msg = `Best MegaLoc score in this shot is ${bestScore.toFixed(3)} (${bestStem}).\n\n` +
+        `Scores below 0.15 are in the noise band — the reference FAISS index ` +
+        `likely doesn't cover this location, and SFM will almost certainly fail ` +
+        `in Phase 1.\n\nRun anyway?`;
+      if (!confirm(msg)) return;
+    }
     b.disabled = true;
     await fetch(`/api/shots/${id}/run`, {method: "POST"});
     loadProject();
@@ -99,11 +118,24 @@ function renderShots(shots) {
     const logEl = document.getElementById(`log-${id}`);
     if (logEl.classList.contains("open")) {
       logEl.classList.remove("open");
+      openLogs.delete(id);
       return;
     }
     logEl.classList.add("open");
+    openLogs.add(id);
     await refreshLog(id);
   }));
+  // Re-apply .open for any logs the user had expanded — poll re-renders
+  // otherwise clobber them.
+  for (const id of openLogs) {
+    const logEl = document.getElementById(`log-${id}`);
+    if (logEl) {
+      logEl.classList.add("open");
+      refreshLog(id);
+    } else {
+      openLogs.delete(id);  // shot deleted
+    }
+  }
 }
 
 async function refreshLog(id) {
@@ -276,12 +308,6 @@ function escapeHtml(s) {
 }
 
 loadProject();
-// Poll every 2s so running shots update fast
-setInterval(async () => {
-  await loadProject();
-  // Refresh any open logs
-  document.querySelectorAll(".log.open").forEach(el => {
-    const id = el.id.replace(/^log-/, "");
-    refreshLog(id);
-  });
-}, 2000);
+// Poll every 2s so running shots update fast; open logs survive re-renders
+// because renderShots() re-applies the .open class from the openLogs set.
+setInterval(loadProject, 2000);
