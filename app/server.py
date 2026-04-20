@@ -1,5 +1,6 @@
 """Flask web server for snapapp."""
 import json
+import re
 import shutil
 import sys
 import threading
@@ -147,6 +148,289 @@ def _chunk_path(upload_id: str) -> Path:
     if not safe or safe != upload_id:
         abort(400, "bad upload id")
     return CHUNK_UPLOADS_DIR / safe
+
+
+def _ingest_sqlite_as_project(sqlite_path: Path, orig_name: str, project_name: str = "") -> tuple:
+    """Turn an uploaded sqlite file into a project + default shot + megaloc kickoff.
+
+    Shared by the browser finalize flow, the legacy single-shot upload, and the
+    new mobile chunked upload. Returns (status_code, response_dict).
+
+    `sqlite_path` is moved into the project dir (caller shouldn't use it after).
+    On an unrecognized schema we clean up the project row and return 400 with
+    gcdb_read.inspect() output so the client can surface it.
+    """
+    default_name = Path(orig_name).stem if orig_name else "sqlite project"
+    pid = db.create_project(project_name or default_name, "sqlite", meta={})
+
+    dst = paths.new_project_sqlite_path(pid, orig_name or "upload.db")
+    shutil.move(str(sqlite_path), str(dst))
+
+    probe = gcdb_read.probe_gcdb(dst)
+    fmt = probe.get("format")
+    if not probe.get("ok") or fmt != "snapapp":
+        # Not a SnapApp schema — surface an actionable error.
+        probe["inspection"] = gcdb_read.inspect(dst)
+        shutil.rmtree(paths.project_dir(pid), ignore_errors=True)
+        db.delete_project(pid)
+        return 400, {
+            "error": "Unrecognized sqlite schema (need SnapApp `shots` table)",
+            "format": fmt,
+            "probe": probe,
+        }
+
+    photos_dir = paths.project_photos_dir(pid)
+    extracted = gcdb_read.extract_snapapp_wide(dst, photos_dir)
+    if not extracted:
+        shutil.rmtree(paths.project_dir(pid), ignore_errors=True)
+        db.delete_project(pid)
+        return 400, {"error": "SnapApp .db had no wide_jpeg rows"}
+
+    shot_meta = {e["filename"]: {
+        "shot_id": e["shot_id"], "lat": e["lat"], "lon": e["lon"],
+        "bearing_deg": e["bearing_deg"], "accuracy_m": e["accuracy_m"],
+        "captured_at": e["captured_at"],
+    } for e in extracted}
+    with db.conn() as c:
+        c.execute(
+            "UPDATE projects SET meta_json = ? WHERE id = ?",
+            (json.dumps({
+                "source": "snapapp",
+                "original_filename": orig_name,
+                "n_sqlite_shots": len(extracted),
+                "bounds": probe.get("bounds"),
+                "photo_meta": shot_meta,
+            }), pid),
+        )
+    photo_stems = [Path(e["filename"]).stem for e in extracted]
+    db.create_shot(
+        pid, name=f"All {len(extracted)} shots (default)",
+        meta={"photo_stems": photo_stems,
+              "photo_names": [e["filename"] for e in extracted]},
+    )
+    pipeline.start_megaloc_prematch(pid)
+    return 200, {
+        "project_id": pid, "kind": "sqlite",
+        "format": "snapapp", "n_shots": len(extracted),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mobile phone chunked upload — RFC 7233 Content-Range semantics
+# ---------------------------------------------------------------------------
+
+# Restrict upload-id to our own expected UUID shape. Stricter than the browser
+# flow because the phone client controls this directly over the network.
+_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+# Phone clients must send chunks ≤ this. Keeps us comfortably under
+# Cloudflare's ~100 MB body cap even with header overhead.
+MOBILE_MAX_CHUNK = 16 * 1024 * 1024  # 16 MiB
+# Absolute ceiling on a single uploaded file. The pipeline is happy with
+# SnapApp sqlites well under this; this just prevents runaway upload-id's
+# from filling the partials dir.
+MOBILE_MAX_TOTAL = 4 * 1024 * 1024 * 1024  # 4 GB
+
+
+def _mobile_chunk_path(upload_id: str):
+    """Validate the phone-supplied upload-id, return (path, err_response).
+
+    Keeps the partial in the same directory as the browser flow so
+    `_chunk_path` and this share a storage area — they never collide because
+    browser ids come from uuid.v4() and this regex only accepts the same
+    alphabet.
+    """
+    if not upload_id or not _UPLOAD_ID_RE.match(upload_id):
+        return None, (jsonify({"error": "bad X-Upload-Id (need 8-64 [A-Za-z0-9_-] chars)"}), 400)
+    return CHUNK_UPLOADS_DIR / upload_id, None
+
+
+def _parse_content_range(header: str):
+    """Parse `bytes <start>-<end>/<total>` → (start, end, total) or None.
+
+    `<end>` is inclusive per RFC 7233. Returns None on anything malformed;
+    caller turns that into 400.
+    """
+    if not header:
+        return None
+    m = re.match(r"^\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$", header)
+    if not m:
+        return None
+    start, end, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if end < start or total <= 0 or end >= total:
+        return None
+    return start, end, total
+
+
+def _sanitize_filename(name: str) -> str:
+    """Strip paths, forbid traversal, keep just the basename."""
+    if not name:
+        return "upload.db"
+    # Basename only — refuse paths and anything suspicious.
+    base = Path(name).name
+    # Drop any control chars / leading dots that could trip path logic.
+    base = base.lstrip(".") or "upload.db"
+    # Allow reasonably broad charset; this is stored as a meta hint, not a path.
+    safe = re.sub(r"[^A-Za-z0-9._\- ]+", "_", base)
+    return safe[:200] or "upload.db"
+
+
+@app.route("/api/mobile/upload", methods=["POST"])
+def api_mobile_upload():
+    """Chunked upload endpoint for the phone capture app.
+
+    Each chunk is a raw octet-stream body (NOT multipart) with:
+      - Content-Range: bytes <start>-<end>/<total>   (end inclusive, RFC 7233)
+      - X-Upload-Id: <stable uuid across all chunks of one file>
+      - X-Filename: <original basename, e.g. 2026-04-20_maple-street.db>
+
+    Returns:
+      - 200 + {upload_id, received, total, complete: false} on a partial
+      - 200 + {..., complete: true, project_id, project_url, format, n_shots}
+        on the final chunk once the sqlite is ingested
+      - 400 on malformed headers / bad filename / unrecognized schema
+      - 409 {error: "offset_mismatch", expected, got} if start != existing size
+      - 413 if a single chunk is larger than MOBILE_MAX_CHUNK
+    """
+    upload_id = request.headers.get("X-Upload-Id", "").strip()
+    path, err = _mobile_chunk_path(upload_id)
+    if err is not None:
+        return err
+
+    cr = request.headers.get("Content-Range", "")
+    parsed = _parse_content_range(cr)
+    if parsed is None:
+        return jsonify({"error": "bad or missing Content-Range header (need 'bytes S-E/T')"}), 400
+    start, end, total = parsed
+    chunk_len = end - start + 1
+
+    if total > MOBILE_MAX_TOTAL:
+        return jsonify({"error": f"total size {total} exceeds limit {MOBILE_MAX_TOTAL}"}), 413
+    if chunk_len > MOBILE_MAX_CHUNK:
+        return jsonify({
+            "error": f"chunk size {chunk_len} exceeds limit {MOBILE_MAX_CHUNK}",
+            "max_chunk": MOBILE_MAX_CHUNK,
+        }), 413
+
+    filename = _sanitize_filename(request.headers.get("X-Filename", ""))
+
+    existing = path.stat().st_size if path.exists() else 0
+    if start != existing:
+        # Tell the phone where to resume from. 409 (Conflict) matches what
+        # tus.io uses for this case; easy for the phone client to special-case.
+        return jsonify({
+            "error": "offset_mismatch",
+            "upload_id": upload_id,
+            "expected": existing,
+            "got": start,
+        }), 409
+
+    # Stream the body to disk without buffering it in memory — these can be
+    # 8 MiB+ and we don't want to hold every concurrent upload in RAM.
+    try:
+        with open(path, "ab") as f:
+            remaining = chunk_len
+            stream = request.stream
+            while remaining > 0:
+                buf = stream.read(min(remaining, 1024 * 1024))
+                if not buf:
+                    break
+                f.write(buf)
+                remaining -= len(buf)
+    except Exception as e:
+        app.logger.exception("mobile chunk write failed")
+        return jsonify({"error": f"write failed: {type(e).__name__}: {e}"}), 500
+
+    received = path.stat().st_size
+    # If the client sent fewer bytes than the Content-Range claimed, roll the
+    # partial back to `start` so the phone can resend that chunk cleanly.
+    if received != existing + chunk_len:
+        # Truncate back to where we were — don't leave the partial in a
+        # half-chunk state.
+        with open(path, "r+b") as f:
+            f.truncate(existing)
+        return jsonify({
+            "error": "short_body",
+            "upload_id": upload_id,
+            "expected_bytes": chunk_len,
+            "got_bytes": received - existing,
+        }), 400
+
+    app.logger.info(
+        f"[mobile] upload_id={upload_id} range={start}-{end}/{total} "
+        f"-> received={received} filename={filename}"
+    )
+
+    # Still mid-upload? Just ack the bytes so the phone can send the next chunk.
+    if received < total:
+        return jsonify({
+            "upload_id": upload_id,
+            "received": received,
+            "total": total,
+            "complete": False,
+        })
+
+    # Final chunk — ingest. If anything below fails, blow the partial away
+    # so the phone can retry with a fresh upload_id without tripping over
+    # the stale file.
+    try:
+        status, body = _ingest_sqlite_as_project(path, filename)
+    except Exception as e:
+        app.logger.exception("mobile ingest failed")
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return jsonify({"error": f"ingest failed: {type(e).__name__}: {e}"}), 500
+
+    # `_ingest_sqlite_as_project` already moved the partial into the project
+    # dir on success; on failure it deleted the project. Either way make sure
+    # the partial is gone so a resumed POST starts fresh.
+    if path.exists():
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+    if status != 200:
+        return jsonify(body), status
+
+    # Build a fully-qualified project URL the phone can deep-link to. Respects
+    # X-Forwarded-Proto/Host so Cloudflare tunnel hostnames round-trip.
+    project_id = body["project_id"]
+    scheme = request.headers.get("X-Forwarded-Proto") or request.scheme
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    project_url = f"{scheme}://{host}/project/{project_id}"
+
+    return jsonify({
+        "upload_id": upload_id,
+        "received": received,
+        "total": total,
+        "complete": True,
+        "project_id": project_id,
+        "project_url": project_url,
+        "format": body.get("format"),
+        "n_shots": body.get("n_shots"),
+    })
+
+
+@app.route("/api/mobile/upload/<upload_id>/status", methods=["GET"])
+def api_mobile_upload_status(upload_id):
+    """Return how many bytes the server has for this upload-id.
+
+    Phone uses this after a reconnect to decide whether to resume or start
+    over. `exists: false` means we have no partial — the client should POST
+    the first chunk starting at offset 0.
+    """
+    path, err = _mobile_chunk_path(upload_id)
+    if err is not None:
+        return err
+    if not path.exists():
+        return jsonify({"upload_id": upload_id, "exists": False, "received": 0})
+    return jsonify({
+        "upload_id": upload_id,
+        "exists": True,
+        "received": path.stat().st_size,
+    })
 
 
 @app.route("/api/upload/chunk", methods=["POST"])
