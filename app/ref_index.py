@@ -14,7 +14,15 @@ from pathlib import Path
 
 from . import paths
 
-_CACHE_PATH = paths.DATA_DIR / "ref_index.json"
+
+def _cache_path() -> Path:
+    # Hash the model dir so switching REF_MODEL_DIR invalidates the cache
+    # automatically instead of silently reusing stale geographic indices.
+    import hashlib
+    h = hashlib.sha1(str(paths.REF_MODEL_DIR).encode()).hexdigest()[:12]
+    return paths.DATA_DIR / f"ref_index.{h}.json"
+
+
 _MEM_CACHE = None
 
 
@@ -83,16 +91,17 @@ def load():
     global _MEM_CACHE
     if _MEM_CACHE is not None:
         return _MEM_CACHE
-    if _CACHE_PATH.exists():
+    cp = _cache_path()
+    if cp.exists():
         try:
-            with open(_CACHE_PATH) as f:
+            with open(cp) as f:
                 _MEM_CACHE = json.load(f)
             return _MEM_CACHE
         except Exception:
             pass
     _MEM_CACHE = _build_index()
-    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_CACHE_PATH, "w") as f:
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    with open(cp, "w") as f:
         json.dump(_MEM_CACHE, f)
     return _MEM_CACHE
 

@@ -62,6 +62,38 @@ templates/
 └── viewer.html
 ```
 
+## Configuring a reference dataset
+
+Each reference dataset is three things on disk:
+
+| | Default | Env override |
+|---|---|---|
+| FAISS index + paths.json | `~/reference_db/` | `SNAPAPP_MEGALOC_DB` |
+| COLMAP text model | `~/undistorted_images/sparse/` | `SNAPAPP_REF_MODEL_DIR` |
+| Ref image root | `~/undistorted_images/images/` | `SNAPAPP_REF_IMAGES_DIR` (local pass-through) or `SNAPAPP_REF_IMAGES_URL` (see below) |
+| Optional GCDB metadata | `~/reference_images/` | `SNAPAPP_MEGALOC_GCDB_DIR` |
+
+To switch references (e.g. Manhattan Beach → Lomita), set those four
+env vars and restart the server. `ref_index.json` is keyed by a hash
+of `REF_MODEL_DIR` so stale geographic indexes from a previous dataset
+don't leak in.
+
+Build a new FAISS index with the right layout:
+
+```bash
+# For split-pano datasets (default):
+python3 ~/megaloc_shotmatch/build_faiss.py \
+    --input /path/to/images --output-dir /path/to/ref_db
+
+# For flat already-undistorted datasets:
+python3 ~/megaloc_shotmatch/build_faiss.py \
+    --input /path/to/images --output-dir /path/to/ref_db \
+    --layout flat
+```
+
+The layout is recorded in `reference_paths.json` so `match_photos.py`
+picks the right shot-key derivation automatically.
+
 ## Reference imagery storage
 
 Reference photos are read through `app/ref_cache.py`, which supports

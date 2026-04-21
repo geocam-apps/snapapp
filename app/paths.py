@@ -1,4 +1,5 @@
 """Filesystem layout for project uploads and pipeline outputs."""
+import os
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -6,14 +7,31 @@ DATA_DIR = BASE / "data"
 PROJECTS_DIR = DATA_DIR / "projects"
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# External tools
 HOME = Path.home()
-MEGALOC_REPO = HOME / "megaloc_shotmatch"
-SHOTMATCH_REPO = HOME / "shotmatch_pose"
-MEGALOC_DB = HOME / "reference_db"
-MEGALOC_GCDB_DIR = HOME / "reference_images"
-REF_MODEL_DIR = HOME / "undistorted_images" / "sparse"
-REF_IMAGES_DIR = HOME / "undistorted_images" / "images"
+
+
+def _p(env_name: str, default: Path) -> Path:
+    v = os.environ.get(env_name)
+    return Path(v) if v else default
+
+
+# External tools (repo clones, usually in $HOME)
+MEGALOC_REPO = _p("SNAPAPP_MEGALOC_REPO", HOME / "megaloc_shotmatch")
+SHOTMATCH_REPO = _p("SNAPAPP_SHOTMATCH_REPO", HOME / "shotmatch_pose")
+
+# Reference dataset.
+#   MEGALOC_DB          — dir containing reference.faiss + reference_paths.json
+#   MEGALOC_GCDB_DIR    — dir of .gcdb metadata files (for GPS on ref matches,
+#                         optional — harmless if missing)
+#   REF_MODEL_DIR       — COLMAP text model (cameras.txt / images.txt) for the
+#                         reference scene
+#   REF_IMAGES_DIR      — local fallback for reference JPEGs; the actual
+#                         `--images` root is resolved by app.ref_cache, which
+#                         can also pull from S3/MinIO on demand
+MEGALOC_DB = _p("SNAPAPP_MEGALOC_DB", HOME / "reference_db")
+MEGALOC_GCDB_DIR = _p("SNAPAPP_MEGALOC_GCDB_DIR", HOME / "reference_images")
+REF_MODEL_DIR = _p("SNAPAPP_REF_MODEL_DIR", HOME / "undistorted_images" / "sparse")
+REF_IMAGES_DIR = _p("SNAPAPP_REF_IMAGES_DIR", HOME / "undistorted_images" / "images")
 
 
 def project_dir(project_id: str) -> Path:
