@@ -97,6 +97,40 @@ def _evict_lru():
             pass
 
 
+_S3_CLIENT = None
+
+
+def _s3_client():
+    """Lazily create a boto3 S3 client, honoring MinIO-style env vars:
+
+      SNAPAPP_S3_ENDPOINT_URL   custom endpoint (e.g. http://minio-dn.geocam.io)
+      SNAPAPP_S3_ACCESS_KEY     access key (falls back to AWS_ACCESS_KEY_ID)
+      SNAPAPP_S3_SECRET_KEY     secret key (falls back to AWS_SECRET_ACCESS_KEY)
+      SNAPAPP_S3_REGION         region name (default us-east-1)
+    """
+    global _S3_CLIENT
+    if _S3_CLIENT is not None:
+        return _S3_CLIENT
+    try:
+        import boto3
+    except ImportError as e:
+        raise RuntimeError(
+            "SNAPAPP_REF_IMAGES_URL is s3:// but boto3 is not installed"
+        ) from e
+    kwargs = {}
+    endpoint = os.environ.get("SNAPAPP_S3_ENDPOINT_URL")
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
+    ak = os.environ.get("SNAPAPP_S3_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID")
+    sk = os.environ.get("SNAPAPP_S3_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if ak and sk:
+        kwargs["aws_access_key_id"] = ak
+        kwargs["aws_secret_access_key"] = sk
+    kwargs["region_name"] = os.environ.get("SNAPAPP_S3_REGION", "us-east-1")
+    _S3_CLIENT = boto3.client("s3", **kwargs)
+    return _S3_CLIENT
+
+
 def _fetch_one(rel: str):
     dst = CACHE_ROOT / rel
     if dst.exists():
@@ -105,16 +139,9 @@ def _fetch_one(rel: str):
     dst.parent.mkdir(parents=True, exist_ok=True)
     u = _url()
     if _is_s3():
-        try:
-            import boto3  # lazy import
-        except ImportError as e:
-            raise RuntimeError(
-                "SNAPAPP_REF_IMAGES_URL is s3:// but boto3 is not installed"
-            ) from e
         bucket, prefix = _parse_s3(u)
         key = f"{prefix}/{rel}" if prefix else rel
-        s3 = boto3.client("s3")
-        s3.download_file(bucket, key, str(dst))
+        _s3_client().download_file(bucket, key, str(dst))
     else:
         # Local-but-not-root source (rare path): copy in. The common
         # case is handled upstream — root_path() returns the source dir
