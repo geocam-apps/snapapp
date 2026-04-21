@@ -431,7 +431,11 @@ def _run_register_independent(shot_id, log_path, staging_dir, matches,
             "--matched-shot", anchor_shot_id,
             "--capture", anchor_capture,
             "--output", str(mini_dir),
-            "--n-shots", "10",
+            # 'fallback' tries strict → aggressive → max in register_photo
+            # until one registers. Trades accuracy for yield — the right
+            # call here since MegaLoc+GPS have already pinned the general
+            # location and an "almost" pose still lands in the right area.
+            "--profile", "fallback",
         ]
         log_append(log_path, f"[sfm] ({i+1}/{len(photo_stems)}) {stem} "
                              f"→ ref {anchor_shot_id} (score={pick['score']:.3f})")
@@ -559,7 +563,7 @@ def _run_register_photo(shot_id, log_path, photo_path, anchor_stem,
         "--matched-shot", anchor_shot_id,
         "--capture", anchor_capture or "",
         "--output", str(shot_out_dir),
-        "--n-shots", "10",
+        "--profile", "fallback",
     ]
     log_append(log_path, f"[sfm] cmd: {' '.join(cmd)}")
     db.update_shot(shot_id, phase="phase1",
