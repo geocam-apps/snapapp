@@ -65,7 +65,13 @@ def run_megaloc_for_project(project_id: str) -> dict:
     if project is None:
         raise RuntimeError("Project not found")
 
-    photos_dir = paths.project_photos_dir(project_id)
+    # Run MegaLoc against the flat one-per-shot dir of wide JPEGs, not the
+    # per-shot bundle subdirs. Match keys end up as `shot_<id:05d>`.
+    photos_dir = paths.project_megaloc_in_dir(project_id)
+    if not photos_dir.exists() or not any(photos_dir.iterdir()):
+        # Legacy projects (or image-uploaded projects) used the flat
+        # photos/ directly.
+        photos_dir = paths.project_photos_dir(project_id)
     csv_path = paths.project_megaloc_csv(project_id)
     log_path = paths.project_dir(project_id) / "megaloc.log"
 
@@ -144,7 +150,12 @@ def _annotate_matches_with_gps(matches: dict, photo_meta: dict) -> dict:
     if not idx:
         return matches
     for stem, m in matches.items():
-        meta = (photo_meta or {}).get(stem + ".jpg") or {}
+        # New layout: MegaLoc keys are `shot_<id:05d>`; photo_meta keys are
+        # the full per-bundle path like `shot_<id:05d>/wide.jpg`. Try the
+        # full path first, fall back to the legacy flat key.
+        meta = ((photo_meta or {}).get(f"{stem}/wide.jpg")
+                or (photo_meta or {}).get(stem + ".jpg")
+                or {})
         phone_lat = meta.get("lat")
         phone_lon = meta.get("lon")
         accuracy = meta.get("accuracy_m") or 0
@@ -632,51 +643,73 @@ def _process_shot(shot_id: str):
                        phase_label="Starting", progress=0.02, error=None)
 
         meta = shot.get("meta") or {}
+        photo_names = meta.get("photo_names") or []
         photo_stems = meta.get("photo_stems") or []
-        if not photo_stems:
+        if not photo_names:
             raise RuntimeError("Shot has no photos assigned")
 
-        photos_dir = paths.project_photos_dir(project["id"])
-        # Resolve photo stems to file paths
+        photos_root = paths.project_photos_dir(project["id"])
+        # Resolve relative photo names ("shot_00001/wide.jpg") to file paths.
+        # Fall back to a flat lookup for legacy projects.
         photo_files = []
-        for stem in photo_stems:
-            found = None
-            for p in photos_dir.iterdir():
-                if p.stem == stem:
-                    found = p
-                    break
-            if found is None:
-                raise RuntimeError(f"Photo for stem '{stem}' not found")
-            photo_files.append(found)
+        for name in photo_names:
+            full = photos_root / name
+            if not full.exists():
+                # Legacy flat layout: try to find by stem
+                stem = Path(name).stem
+                full = next((p for p in photos_root.iterdir()
+                             if p.is_file() and p.stem == stem), None)
+            if full is None or not full.exists():
+                raise RuntimeError(f"Photo '{name}' not found in {photos_root}")
+            photo_files.append(full)
 
-        # Step 1: megaloc
+        # Step 1: megaloc — runs per-project on the flat wides dir; we just
+        # consume its cached output here.
         db.update_shot(shot_id, phase="megaloc", phase_label="Running MegaLoc", progress=0.05)
         log_append(log_path, "[megaloc] running...")
         matches = run_megaloc_for_project(project["id"])
-        # GPS-annotate the top-K matches so _choose_anchor can filter by
-        # proximity to the phone's reported position.
         project_meta = project.get("meta") or {}
         photo_meta = project_meta.get("photo_meta") or {}
         _annotate_matches_with_gps(matches, photo_meta)
         log_append(log_path, f"[megaloc] got {len(matches)} matches total")
 
-        anchor_stem, anchor_info = _choose_anchor(
-            matches, photo_stems, pinned_stem=meta.get("anchor_override"),
+        # Anchor selection. Bundles always anchor on the wide JPEG (best
+        # match for the reference 65° HFoV pano sub-views). MegaLoc keys
+        # the wide as `shot_<id:05d>` (the bundle's directory name).
+        shot_dir_name = meta.get("shot_dir") or (
+            photo_stems[0] if photo_stems else None
+        )
+        if shot_dir_name and shot_dir_name in matches:
+            # Single-photo lookup against the bundle's wide entry.
+            anchor_stem_for_pick = shot_dir_name
+            megaloc_keys = [shot_dir_name]
+        else:
+            # Legacy / non-bundle: iterate over individual photo stems.
+            megaloc_keys = photo_stems
+            anchor_stem_for_pick = None
+
+        anchor_key, anchor_info = _choose_anchor(
+            matches, megaloc_keys,
+            pinned_stem=meta.get("anchor_override") or anchor_stem_for_pick,
         )
         anchor_shot_id = anchor_info["shot_id"]
         anchor_capture = anchor_info["capture"]
         anchor_score = anchor_info["score"]
+        # The "anchor" inside the bundle is always the wide.jpg file in
+        # the bundle dir; that's the photo whose pose is solved against
+        # refs in Phase 1.
+        anchor_stem_in_bundle = meta.get("wide_stem") or "wide"
         gps_note = ""
         if anchor_info.get("distance_m") is not None:
             gps_note = (f" GPS_d={anchor_info['distance_m']:.0f}m"
                         f" within={anchor_info.get('gps_valid')}")
-        log_append(log_path, f"[megaloc] anchor: {anchor_stem} -> "
+        log_append(log_path, f"[megaloc] anchor: {anchor_key} -> "
                               f"{anchor_info['shot_key']} "
                               f"(score={anchor_score:.3f}{gps_note})")
         db.update_shot(
             shot_id, anchor_shot=anchor_shot_id, anchor_score=anchor_score,
             progress=0.10,
-            meta={**meta, "anchor_stem": anchor_stem,
+            meta={**meta, "anchor_stem": anchor_stem_in_bundle,
                   "anchor_shot_key": anchor_info["shot_key"],
                   "anchor_capture": anchor_capture,
                   "anchor_distance_m": anchor_info.get("distance_m"),
@@ -684,7 +717,8 @@ def _process_shot(shot_id: str):
                   "n_photos": len(photo_files)},
         )
 
-        # Step 2: Copy photos into a staging dir for the subprocess
+        # Step 2: stage the bundle photos into a flat dir for the SFM
+        # subprocess (register_sequence_natural globs *.jpg non-recursively).
         shot_out_dir = paths.shot_output_dir(project["id"], shot_id)
         staging_dir = paths.shot_dir(project["id"], shot_id) / "photos"
         if staging_dir.exists():
@@ -692,6 +726,7 @@ def _process_shot(shot_id: str):
         staging_dir.mkdir(parents=True)
         for p in photo_files:
             shutil.copy(p, staging_dir / p.name)
+        anchor_stem = anchor_stem_in_bundle
 
         # Step 3: branch on photo count — single-photo shots go through
         # register_photo.py (PnP against the ref-triangulated scene);
@@ -700,29 +735,31 @@ def _process_shot(shot_id: str):
                        progress=0.15, n_queries=len(photo_files))
 
         # Mode dispatch:
-        #   single photo  → register_photo.py (PnP)
-        #   2+ photos, default  → independent per-photo (one PnP per photo,
-        #                         results unioned). Right for scattered
-        #                         shutter presses (SnapApp style).
-        #   2+ photos, meta.sfm_mode="sequence"  → register_sequence_natural.py
-        #                         (chains phone photos via SIFT). Right for
-        #                         densely-overlapping walkthrough sequences.
+        #   single photo                            → register_photo.py (PnP)
+        #   bundle from one phone shot (default)    → register_sequence_natural
+        #                                             (anchored multi-camera SFM
+        #                                              over wide+mid+5 burst —
+        #                                              the lateral swipe gives
+        #                                              real baseline)
+        #   meta.sfm_mode="independent"             → independent per-photo
+        #                                             (one PnP per photo,
+        #                                              results unioned)
         if len(photo_files) == 1:
             anchor_photo = staging_dir / photo_files[0].name
             _run_register_photo(
                 shot_id, log_path, anchor_photo, anchor_stem,
                 anchor_shot_id, anchor_capture, shot_out_dir,
             )
-        elif meta.get("sfm_mode") == "sequence":
+        elif meta.get("sfm_mode") == "independent":
+            _run_register_independent(
+                shot_id, log_path, staging_dir, matches, photo_stems,
+                shot_out_dir,
+            )
+        else:
             _run_register_sequence(
                 shot_id, log_path, staging_dir, anchor_stem,
                 anchor_shot_id, anchor_capture, shot_out_dir,
                 n_shots_neighbours=int(meta.get("n_shots") or 15),
-            )
-        else:
-            _run_register_independent(
-                shot_id, log_path, staging_dir, matches, photo_stems,
-                shot_out_dir,
             )
 
         summary_path = shot_out_dir / "sequence.json"

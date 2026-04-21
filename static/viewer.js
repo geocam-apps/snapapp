@@ -125,10 +125,15 @@ function sceneCenter(cams) {
 let sceneData = null;
 
 async function load() {
-  const r = await fetch(`/api/shots/${SHOT_ID}/scene`);
+  const url = SHOT_ID
+    ? `/api/shots/${SHOT_ID}/scene`
+    : `/api/projects/${PROJECT_ID}/scene`;
+  const r = await fetch(url);
   if (!r.ok) {
     const msg = r.status === 404
-      ? `No reconstructed model yet. The shot may still be running — return to the project and wait for the progress to complete.`
+      ? (SHOT_ID
+          ? `No reconstructed model yet. The shot may still be running — return to the project and wait for the progress to complete.`
+          : `No completed shots in this project yet — run some shots first.`)
       : `Failed to load: HTTP ${r.status}`;
     document.getElementById("summary").innerHTML =
       `<span style="color:#c66">${msg}</span>`;

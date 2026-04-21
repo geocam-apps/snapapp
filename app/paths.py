@@ -28,6 +28,15 @@ def project_photos_dir(project_id: str) -> Path:
     return d
 
 
+def project_megaloc_in_dir(project_id: str) -> Path:
+    """Flat directory of one image per phone-shot (its wide.jpg) used as
+    the MegaLoc query set. Lives alongside `photos/` so MegaLoc doesn't
+    have to walk the per-shot subdirs or know about burst frames."""
+    d = project_dir(project_id) / "megaloc_in"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 SQLITE_EXTS = (".db", ".sqlite", ".sqlite3", ".gcdb")
 
 

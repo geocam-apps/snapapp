@@ -70,8 +70,14 @@
 
 <script>
   const parts = location.pathname.split("/");
-  window.PROJECT_ID = parts[2];
-  window.SHOT_ID = parts[3];
+  // /shot/<project>/<shot>  vs  /scene/<project>
+  if (parts[1] === "scene") {
+    window.PROJECT_ID = parts[2];
+    window.SHOT_ID = null;
+  } else {
+    window.PROJECT_ID = parts[2];
+    window.SHOT_ID = parts[3];
+  }
 </script>
 <script type="importmap">
 {

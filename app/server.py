@@ -75,6 +75,13 @@ def shot_viewer(project_id, shot_id):
     return render_template("viewer.html", v=ASSET_VERSION)
 
 
+@app.route("/scene/<project_id>")
+def project_scene_viewer(project_id):
+    if db.get_project(project_id) is None:
+        abort(404)
+    return render_template("viewer.html", v=ASSET_VERSION)
+
+
 # ---------------------------------------------------------------------------
 # Projects API
 # ---------------------------------------------------------------------------
@@ -101,9 +108,14 @@ def api_project(project_id):
         abort(404)
     shots = db.list_shots(project_id)
     p["shots"] = shots
-    # List uploaded photos
+    # List uploaded photos. New SnapApp layout has them in per-shot subdirs
+    # (`shot_<id:05d>/{wide,mid,burst_NN}.jpg`) — walk recursively and
+    # return paths relative to photos/. Legacy flat layouts still work.
     photos_dir = paths.project_photos_dir(project_id)
-    photos = sorted([f.name for f in photos_dir.iterdir() if f.is_file()]) if photos_dir.exists() else []
+    photos = []
+    if photos_dir.exists():
+        for f in sorted(photos_dir.rglob("*.jpg")):
+            photos.append(str(f.relative_to(photos_dir)))
     p["photos"] = photos
     # If sqlite, include probe info
     sqlite_path = paths.project_sqlite_path(project_id)
@@ -161,6 +173,49 @@ def _chunk_path(upload_id: str) -> Path:
     return CHUNK_UPLOADS_DIR / safe
 
 
+def _create_snapapp_shots_from_extraction(pid: str, extracted: list):
+    """Create one snapapp shot per phone-shot bundle, status=pending.
+
+    Each row in `extracted` is one phone shutter press containing a 7-photo
+    bundle (wide + mid + 5 burst). Each becomes its own snapapp shot — the
+    bundle is the SFM unit; we never combine photos across phone shots.
+    """
+    photo_meta = {}
+    for e in extracted:
+        # Track per-photo metadata (GPS, bearing) for every photo in the
+        # bundle, keyed by the relative photo path used in the photo grid.
+        for fname in e["photo_filenames"]:
+            photo_meta[fname] = {
+                "shot_id": e["shot_id"],
+                "lat": e["lat"], "lon": e["lon"],
+                "bearing_deg": e["bearing_deg"],
+                "accuracy_m": e["accuracy_m"],
+                "captured_at": e["captured_at"],
+            }
+        stems = [Path(fn).stem for fn in e["photo_filenames"]]
+        # Use the wide as the MegaLoc anchor candidate.
+        wide_stem = Path(e["wide_filename"]).stem  # "wide"
+        db.create_shot(
+            pid,
+            name=f"Shot {e['shot_id']}",
+            meta={
+                "phone_shot_id": e["shot_id"],
+                "shot_dir": e["dir"],
+                "photo_stems": stems,
+                "photo_names": e["photo_filenames"],
+                "wide_stem": wide_stem,
+                "wide_filename": e["wide_filename"],
+                "n_burst": e["n_burst"],
+                "lat": e["lat"], "lon": e["lon"],
+                "bearing_deg": e["bearing_deg"],
+                "accuracy_m": e["accuracy_m"],
+                "captured_at": e["captured_at"],
+                "anchor_override": wide_stem,
+            },
+        )
+    return photo_meta
+
+
 def _ingest_sqlite_as_project(sqlite_path: Path, orig_name: str, project_name: str = "") -> tuple:
     """Turn an uploaded sqlite file into a project + default shot + megaloc kickoff.
 
@@ -191,17 +246,13 @@ def _ingest_sqlite_as_project(sqlite_path: Path, orig_name: str, project_name: s
         }
 
     photos_dir = paths.project_photos_dir(pid)
-    extracted = gcdb_read.extract_snapapp_wide(dst, photos_dir)
+    extracted = gcdb_read.extract_snapapp_bundle(dst, photos_dir)
     if not extracted:
         shutil.rmtree(paths.project_dir(pid), ignore_errors=True)
         db.delete_project(pid)
-        return 400, {"error": "SnapApp .db had no wide_jpeg rows"}
+        return 400, {"error": "SnapApp .db had no shots with images"}
 
-    shot_meta = {e["filename"]: {
-        "shot_id": e["shot_id"], "lat": e["lat"], "lon": e["lon"],
-        "bearing_deg": e["bearing_deg"], "accuracy_m": e["accuracy_m"],
-        "captured_at": e["captured_at"],
-    } for e in extracted}
+    photo_meta = _create_snapapp_shots_from_extraction(pid, extracted)
     with db.conn() as c:
         c.execute(
             "UPDATE projects SET meta_json = ? WHERE id = ?",
@@ -210,15 +261,9 @@ def _ingest_sqlite_as_project(sqlite_path: Path, orig_name: str, project_name: s
                 "original_filename": orig_name,
                 "n_sqlite_shots": len(extracted),
                 "bounds": probe.get("bounds"),
-                "photo_meta": shot_meta,
+                "photo_meta": photo_meta,
             }), pid),
         )
-    photo_stems = [Path(e["filename"]).stem for e in extracted]
-    db.create_shot(
-        pid, name=f"All {len(extracted)} shots (default)",
-        meta={"photo_stems": photo_stems,
-              "photo_names": [e["filename"] for e in extracted]},
-    )
     pipeline.start_megaloc_prematch(pid)
     return 200, {
         "project_id": pid, "kind": "sqlite",
@@ -512,69 +557,14 @@ def api_upload_finalize():
         if not p.exists():
             return jsonify({"error": f"missing chunk {f.get('upload_id')}"}), 400
 
-    default_name = (Path(files[0]["filename"]).stem if kind == "sqlite"
-                    else f"{len(files)} photos")
-    pid = db.create_project(name or default_name, kind, meta={})
-
     if kind == "sqlite":
         src = _chunk_path(files[0]["upload_id"])
         orig_name = files[0].get("filename") or "upload.db"
-        dst = paths.new_project_sqlite_path(pid, orig_name)
-        _sh.move(str(src), str(dst))
-        probe = gcdb_read.probe_gcdb(dst)
-        fmt = probe.get("format")
-        if not probe.get("ok") or fmt == "unknown":
-            probe["inspection"] = gcdb_read.inspect(dst)
+        status, body = _ingest_sqlite_as_project(src, orig_name, name)
+        return jsonify(body), status
 
-        if fmt == "snapapp" and probe.get("ok"):
-            # Extract the 1× wide JPEG from every capture row — they match the
-            # reference panorama sub-views' ~65° HFoV far better than the
-            # zoomed-in burst frames would.
-            photos_dir = paths.project_photos_dir(pid)
-            extracted = gcdb_read.extract_snapapp_wide(dst, photos_dir)
-            if not extracted:
-                _sh.rmtree(paths.project_dir(pid), ignore_errors=True)
-                db.delete_project(pid)
-                return jsonify({"error": "SnapApp .db had no wide_jpeg rows"}), 400
-            # Preserve the per-photo GPS/bearing in project meta so the UI
-            # can render it even after extraction drops the BLOBs.
-            shot_meta = {e["filename"]: {
-                "shot_id": e["shot_id"],
-                "lat": e["lat"], "lon": e["lon"],
-                "bearing_deg": e["bearing_deg"],
-                "accuracy_m": e["accuracy_m"],
-                "captured_at": e["captured_at"],
-            } for e in extracted}
-            db.update_project_meta = getattr(db, "update_project_meta", None)
-            # (no helper — just overwrite via internal SQL below)
-            import json as _json
-            with db.conn() as c:
-                c.execute(
-                    "UPDATE projects SET meta_json = ? WHERE id = ?",
-                    (_json.dumps({
-                        "source": "snapapp",
-                        "original_filename": orig_name,
-                        "n_sqlite_shots": len(extracted),
-                        "bounds": probe.get("bounds"),
-                        "photo_meta": shot_meta,
-                    }), pid),
-                )
-            # Default snapapp-shot: one SFM run over every extracted photo
-            photo_stems = [Path(e["filename"]).stem for e in extracted]
-            db.create_shot(
-                pid, name=f"All {len(extracted)} shots (default)",
-                meta={"photo_stems": photo_stems,
-                      "photo_names": [e["filename"] for e in extracted]},
-            )
-            pipeline.start_megaloc_prematch(pid)
-            return jsonify({
-                "project_id": pid, "kind": kind,
-                "format": "snapapp", "n_shots": len(extracted),
-            })
-
-        # Legacy gcdb or unknown: keep the file around but no pipeline path.
-        return jsonify({"project_id": pid, "kind": kind, "sqlite": probe})
-
+    default_name = f"{len(files)} photos"
+    pid = db.create_project(name or default_name, kind, meta={})
     photos_dir = paths.project_photos_dir(pid)
     saved = []
     for f in files:
@@ -654,16 +644,12 @@ def api_upload():
             probe["inspection"] = gcdb_read.inspect(dst)
         if probe.get("format") == "snapapp" and probe.get("ok"):
             photos_dir = paths.project_photos_dir(pid)
-            extracted = gcdb_read.extract_snapapp_wide(dst, photos_dir)
+            extracted = gcdb_read.extract_snapapp_bundle(dst, photos_dir)
             if not extracted:
                 shutil.rmtree(paths.project_dir(pid), ignore_errors=True)
                 db.delete_project(pid)
-                return jsonify({"error": "SnapApp .db had no wide_jpeg rows"}), 400
-            shot_meta = {e["filename"]: {
-                "shot_id": e["shot_id"], "lat": e["lat"], "lon": e["lon"],
-                "bearing_deg": e["bearing_deg"], "accuracy_m": e["accuracy_m"],
-                "captured_at": e["captured_at"],
-            } for e in extracted}
+                return jsonify({"error": "SnapApp .db had no shots with images"}), 400
+            photo_meta = _create_snapapp_shots_from_extraction(pid, extracted)
             import json as _json
             with db.conn() as c:
                 c.execute(
@@ -671,15 +657,9 @@ def api_upload():
                     (_json.dumps({
                         "source": "snapapp", "original_filename": orig_name,
                         "n_sqlite_shots": len(extracted),
-                        "bounds": probe.get("bounds"), "photo_meta": shot_meta,
+                        "bounds": probe.get("bounds"), "photo_meta": photo_meta,
                     }), pid),
                 )
-            photo_stems = [Path(e["filename"]).stem for e in extracted]
-            db.create_shot(
-                pid, name=f"All {len(extracted)} shots (default)",
-                meta={"photo_stems": photo_stems,
-                      "photo_names": [e["filename"] for e in extracted]},
-            )
             pipeline.start_megaloc_prematch(pid)
             return jsonify({"project_id": pid, "kind": kind,
                             "format": "snapapp", "n_shots": len(extracted)})
@@ -751,6 +731,28 @@ def api_create_shot(project_id):
     return jsonify({"shot_id": sid})
 
 
+@app.route("/api/projects/<project_id>/run", methods=["POST"])
+def api_run_project(project_id):
+    """Kick off SFM for every pending or failed shot in this project.
+    Optional JSON body {"shot_ids": [...]} restricts to a selection."""
+    p = db.get_project(project_id)
+    if p is None:
+        abort(404)
+    body = request.get_json(silent=True) or {}
+    only = set(body.get("shot_ids") or [])
+    queued = []
+    for s in db.list_shots(project_id):
+        if only and s["id"] not in only:
+            continue
+        if s["status"] not in ("pending", "failed"):
+            continue
+        if not (s.get("meta") or {}).get("photo_names"):
+            continue
+        pipeline.run_shot(s["id"])
+        queued.append(s["id"])
+    return jsonify({"queued": queued, "count": len(queued)})
+
+
 @app.route("/api/shots/<shot_id>/run", methods=["POST"])
 def api_run_shot(shot_id):
     shot = db.get_shot(shot_id)
@@ -806,6 +808,107 @@ def api_shot_log(shot_id):
 # ---------------------------------------------------------------------------
 # 3D viewer API — returns the reconstructed scene for a shot
 # ---------------------------------------------------------------------------
+
+@app.route("/api/projects/<project_id>/scene")
+def api_project_scene(project_id):
+    """Combined scene: union of every done shot's COLMAP model in the project.
+
+    Each per-shot model is already in the reference frame (they were all
+    anchored to the same ref COLMAP via Phase 1), so we can just stack
+    them: keep one copy of any shared ref images by name, append all
+    query images and 3D points from every shot.
+    """
+    p = db.get_project(project_id)
+    if p is None:
+        abort(404)
+    shots = db.list_shots(project_id)
+    done = [s for s in shots if s["status"] == "done"]
+    if not done:
+        abort(404, "No completed shots in this project")
+
+    from colmap_io import read_model, qvec_to_rotmat, image_center
+
+    seen_image_names = set()
+    cameras_out = []
+    points_out = []
+    summaries = []
+
+    for s in done:
+        out_dir = paths.shot_output_dir(project_id, s["id"])
+        model_dir = out_dir / "model"
+        if not model_dir.exists():
+            continue
+        try:
+            cams, imgs, pts = read_model(model_dir)
+        except Exception:
+            continue
+
+        sjson = out_dir / "sequence.json"
+        anchor_stems = set()
+        if sjson.exists():
+            try:
+                summary = json.load(open(sjson))
+                anchor_stems = set(summary.get("anchors", {}).keys())
+                summaries.append({
+                    "shot_id": s["id"],
+                    "name": s.get("name"),
+                    "n_registered": summary.get("n_registered"),
+                    "n_queries": summary.get("n_queries"),
+                })
+            except Exception:
+                pass
+
+        for img in imgs.values():
+            if img.name in seen_image_names:
+                continue
+            seen_image_names.add(img.name)
+            cam = cams[img.camera_id]
+            center = image_center(img).tolist()
+            R = qvec_to_rotmat(img.qvec).tolist()
+            is_query = img.name.startswith("query/")
+            stem = Path(img.name).stem if is_query else None
+            is_anchor = is_query and stem in anchor_stems
+            if cam.model == "SIMPLE_PINHOLE":
+                fx = fy = cam.params[0]; cx, cy = cam.params[1], cam.params[2]
+            elif cam.model == "PINHOLE":
+                fx, fy = cam.params[0], cam.params[1]; cx, cy = cam.params[2], cam.params[3]
+            else:
+                fx = fy = cam.params[0]; cx, cy = cam.width / 2, cam.height / 2
+            if is_query:
+                image_url = f"/api/shots/{s['id']}/image/{stem}"
+            else:
+                image_url = f"/api/ref_image?name={img.name}"
+            cameras_out.append({
+                "name": img.name, "stem": stem,
+                "center": center, "rotation": R,
+                "qvec": list(img.qvec), "tvec": list(img.tvec),
+                "width": cam.width, "height": cam.height,
+                "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                "is_query": is_query, "is_anchor": is_anchor,
+                "shot_id": s["id"], "image_url": image_url,
+                "num_observations": sum(1 for pid in img.point3D_ids if pid >= 0),
+            })
+
+        for pt in pts.values():
+            points_out.append({
+                "xyz": list(pt.xyz), "rgb": list(pt.rgb), "error": pt.error,
+            })
+
+    if len(points_out) > 60000:
+        import random
+        points_out = random.sample(points_out, 60000)
+
+    return jsonify({
+        "project_id": project_id,
+        "cameras": cameras_out,
+        "points": points_out,
+        "summary": {
+            "n_shots": len(done),
+            "shots": summaries,
+            "method": "combined per-shot models in ref frame",
+        },
+    })
+
 
 @app.route("/api/shots/<shot_id>/scene")
 def api_shot_scene(shot_id):
@@ -908,6 +1011,7 @@ def api_ref_image():
 
 @app.route("/api/projects/<project_id>/photo/<path:name>")
 def api_project_photo(project_id, name):
+    # path: lets `name` include slashes (per-shot subdirs)
     if ".." in name:
         abort(400)
     p = paths.project_photos_dir(project_id) / name

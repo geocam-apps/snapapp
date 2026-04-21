@@ -18,23 +18,26 @@
   <section class="shots">
     <div class="row">
       <h2>Shots</h2>
-      <button id="newShotBtn" class="small">+ New shot from selection</button>
+      <div class="actions">
+        <span id="selCount" class="meta" style="margin-right:8px"></span>
+        <button id="runSelectedBtn" class="small" disabled>Run selected</button>
+        <button id="runAllBtn" class="small secondary">Run all pending</button>
+        <a id="combinedSceneBtn" class="small" style="display:none"
+           href="#"><button class="small">Combined 3D scene</button></a>
+      </div>
     </div>
-    <div id="shotsList"></div>
-  </section>
-
-  <section class="photos">
-    <h2>Uploaded photos</h2>
-    <div class="sel-hint">Tap a photo to select it, then use "New shot" to run a sub-sequence.</div>
     <div class="legend">
-      MegaLoc score:
-      <span class="score-pill score-high">≥ 0.50 high</span>
-      <span class="score-pill score-ok">≥ 0.30 good</span>
-      <span class="score-pill score-weak">≥ 0.15 weak</span>
-      <span class="score-pill score-bad">&lt; 0.15 noise</span>
-      <span class="legend-note">— scores below 0.15 mean the ref FAISS index doesn't cover this location; SFM will fail.</span>
+      MegaLoc:
+      <span class="score-pill score-high">≥ 0.50</span>
+      <span class="score-pill score-ok">≥ 0.30</span>
+      <span class="score-pill score-weak">≥ 0.15</span>
+      <span class="score-pill score-bad">&lt; 0.15</span>
+      &nbsp; GPS:
+      <span class="score-pill score-high" style="background:#059669">in radius</span>
+      <span class="score-pill score-bad" style="background:#991b1b">far</span>
+      <span class="legend-note">— each shot is a 7-photo bundle (wide + mid + 5 burst); SFM bundles them with constrained per-zoom intrinsics.</span>
     </div>
-    <div id="photosGrid" class="thumb-grid"></div>
+    <div id="shotTiles" class="shot-grid"></div>
   </section>
 
   <section class="sqlite" id="sqliteSection" style="display:none">
