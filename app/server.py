@@ -999,10 +999,24 @@ def api_ref_image():
     name = request.args.get("name", "")
     if ".." in name:
         abort(400)
-    full = paths.REF_IMAGES_DIR / name
-    if not full.exists():
-        abort(404)
-    return send_file(full)
+    # Prefer the on-demand cache (which passes through to a local root
+    # when one is configured); fall back to the legacy hard-coded path.
+    from app import ref_cache
+    for root in (ref_cache.root_path(), paths.REF_IMAGES_DIR):
+        full = root / name
+        if full.exists():
+            return send_file(full)
+    # Last-ditch: attempt a one-off fetch. If the viewer is asking for a
+    # ref image we didn't already cache (e.g. just opened a done shot
+    # after a cache eviction), pulling it costs one S3 round trip.
+    try:
+        ref_cache.ensure_local([name])
+        full = ref_cache.root_path() / name
+        if full.exists():
+            return send_file(full)
+    except Exception:
+        pass
+    abort(404)
 
 
 # ---------------------------------------------------------------------------

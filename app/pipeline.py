@@ -10,7 +10,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import db, paths, ref_index
+from . import db, paths, ref_cache, ref_index
 
 
 # Both MegaLoc and shotmatch_pose can use the GPU. The GB10's unified-memory
@@ -322,10 +322,52 @@ def run_shot(shot_id: str):
     t.start()
 
 
+_REF_MODEL_CACHE = None
+
+
+def _load_ref_model_once():
+    """Read the reference COLMAP model once (36k images' metadata, ~50 MB
+    of text). Reused across subprocess calls within the server lifetime.
+    """
+    global _REF_MODEL_CACHE
+    if _REF_MODEL_CACHE is not None:
+        return _REF_MODEL_CACHE
+    sys.path.insert(0, str(paths.SHOTMATCH_REPO))
+    from colmap_io import read_model
+    _REF_MODEL_CACHE = read_model(paths.REF_MODEL_DIR)
+    return _REF_MODEL_CACHE
+
+
+def _fetch_ref_images_for_run(matched_shot_id, matched_capture, n_neighbors=15):
+    """Make sure every ref image the SFM subprocess needs is present in the
+    local cache. Returns the local directory to pass as `--images`.
+
+    Bounds what we localize: only the matched shot (3 images) plus its
+    n_neighbors nearest shots (another ~45 images) — never the full ref
+    set, which can be hundreds of GB.
+    """
+    sys.path.insert(0, str(paths.SHOTMATCH_REPO))
+    from register_photo import find_images_for_shot, find_nearby_shots
+
+    _, imgs, _ = _load_ref_model_once()
+    matched_ids = find_images_for_shot(imgs, matched_shot_id, matched_capture)
+    if not matched_ids:
+        # fall back: return the configured root; subprocess will fail
+        # with a clearer error than "S3 key not found".
+        return ref_cache.root_path()
+    keep_ids = find_nearby_shots(imgs, matched_ids, n_neighbors)
+    rel_names = [imgs[i].name for i in keep_ids]
+    return ref_cache.ensure_local(rel_names)
+
+
 def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
                             anchor_shot_id, anchor_capture, shot_out_dir,
                             n_shots_neighbours=15):
     """Multi-photo SFM via register_sequence_natural.py."""
+    images_root = _fetch_ref_images_for_run(
+        anchor_shot_id, anchor_capture, n_shots_neighbours,
+    )
+    log_append(log_path, f"[sfm] ref images root: {images_root}")
     cmd = [
         "python3", "-u",
         str(paths.SHOTMATCH_REPO / "register_sequence_natural.py"),
@@ -333,7 +375,7 @@ def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
         "--anchor", f"{anchor_stem}={anchor_shot_id}",
         "--capture", anchor_capture or "",
         "--model", str(paths.REF_MODEL_DIR),
-        "--images", str(paths.REF_IMAGES_DIR),
+        "--images", str(images_root),
         "--output", str(shot_out_dir),
         "--camera-model", "OPENCV",
         "--n-shots", str(n_shots_neighbours),
@@ -434,11 +476,14 @@ def _run_register_independent(shot_id, log_path, staging_dir, matches,
             progress=frac,
         )
 
+        images_root = _fetch_ref_images_for_run(
+            anchor_shot_id, anchor_capture, n_neighbors=10,
+        )
         cmd = [
             "python3", "-u", str(paths.SHOTMATCH_REPO / "register_photo.py"),
             "--photo", str(photo_path),
             "--model", str(paths.REF_MODEL_DIR),
-            "--images", str(paths.REF_IMAGES_DIR),
+            "--images", str(images_root),
             "--matched-shot", anchor_shot_id,
             "--capture", anchor_capture,
             "--output", str(mini_dir),
@@ -566,17 +611,21 @@ def _run_register_photo(shot_id, log_path, photo_path, anchor_stem,
     with the viewer. Copies the query image into `shot_out_dir/images/` so
     the three.js scene endpoint can serve it.
     """
+    images_root = _fetch_ref_images_for_run(
+        anchor_shot_id, anchor_capture or None, n_neighbors=10,
+    )
     cmd = [
         "python3", "-u", str(paths.SHOTMATCH_REPO / "register_photo.py"),
         "--photo", str(photo_path),
         "--model", str(paths.REF_MODEL_DIR),
-        "--images", str(paths.REF_IMAGES_DIR),
+        "--images", str(images_root),
         "--matched-shot", anchor_shot_id,
         "--capture", anchor_capture or "",
         "--output", str(shot_out_dir),
         "--profile", "fallback",
     ]
     log_append(log_path, f"[sfm] cmd: {' '.join(cmd)}")
+    log_append(log_path, f"[sfm] ref images root: {images_root}")
     db.update_shot(shot_id, phase="phase1",
                    phase_label="Registering photo via PnP", progress=0.30)
     proc = subprocess.Popen(

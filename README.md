@@ -62,6 +62,21 @@ templates/
 └── viewer.html
 ```
 
+## Reference imagery storage
+
+Reference photos are read through `app/ref_cache.py`, which supports
+two modes:
+
+| Env | Behaviour |
+|-----|-----------|
+| `SNAPAPP_REF_IMAGES_URL` unset or local path | Pass-through: subprocesses read directly from the path. Zero copy. |
+| `SNAPAPP_REF_IMAGES_URL=s3://bucket/prefix` | On-demand: before each SFM run, compute the 45-60 images that subprocess will touch (matched shot + N nearest neighbors), download from S3 to `data/ref_cache/` and pass that as `--images`. |
+| `SNAPAPP_REF_CACHE_MAX_GB=20` | LRU-evict (mtime-based) to stay under this cap across runs. |
+
+The reference COLMAP model itself (text files at `REF_MODEL_DIR`,
+~50 MB) stays local — we need it in memory to decide which ref images
+each run needs. The pixel data is what we fetch on demand.
+
 ## Limitations
 
 - **SQLite-only projects** are parsed + displayed but can't be run through
