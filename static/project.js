@@ -115,28 +115,24 @@ function renderShots(shots) {
     // No early block on single-photo shots anymore — the pipeline branches
     // to register_photo.py (PnP against the ref-triangulated scene) for
     // those. Only warn if the best anchor is GPS-far and score-weak.
-    // Find the best per-photo candidate, preferring GPS-valid picks.
-    let bestScore = -1, bestStem = null, bestGpsValid = null, bestDist = null;
+    // Independent mode picks an anchor per photo. Surface a count of how
+    // many photos in the selection have at least one GPS-valid match —
+    // those are the ones likely to register cleanly. The pure-GPS
+    // fallback will still try the rest, but yield drops on those.
+    let withGps = 0, total = 0;
     for (const ps of stems) {
       const m = mm[ps];
       if (!m) continue;
-      const cand = m.gps_best || m;
-      if (cand.score > bestScore) {
-        bestScore = cand.score; bestStem = ps;
-        bestGpsValid = m.gps_best ? true : (cand.gps_valid ?? null);
-        bestDist = cand.distance_m ?? null;
-      }
+      total += 1;
+      if (m.gps_best) withGps += 1;
     }
-    // Warn if the pick is either weak MegaLoc or far from the phone's GPS.
-    const looksBad = (bestScore >= 0 && bestScore < 0.15)
-                   || (bestGpsValid === false);
-    if (looksBad) {
-      const bits = [`Best anchor: ${bestStem} (MegaLoc score ${bestScore.toFixed(3)})`];
-      if (bestDist != null) bits.push(`distance from phone GPS: ${Math.round(bestDist)} m`);
-      if (bestGpsValid === false) bits.push(`— outside the phone's GPS accuracy radius`);
-      if (bestScore < 0.15) bits.push(`— below the 0.15 MegaLoc noise threshold`);
-      const msg = bits.join("\n") +
-        `\n\nSFM is likely to fail. Run anyway?`;
+    if (total > 0 && withGps === 0) {
+      const msg =
+        `None of the ${total} selected photos have a MegaLoc match within ` +
+        `the phone's GPS accuracy radius.\n\n` +
+        `The pipeline will fall back to picking the geographically nearest ` +
+        `reference shot for each, but PnP success is less likely.\n\n` +
+        `Run anyway?`;
       if (!confirm(msg)) return;
     }
     b.disabled = true;
@@ -314,33 +310,18 @@ document.getElementById("newShotBtn").addEventListener("click", async () => {
     alert("Select some photos first (click thumbnails).");
     return;
   }
-  const name = prompt("Name this shot:", `Shot ${new Date().toISOString().slice(11,19)}`);
+  const name = prompt(
+    `Name this shot (${selected.size} photo${selected.size === 1 ? "" : "s"}):`,
+    `Shot ${new Date().toISOString().slice(11,19)}`
+  );
   if (name === null) return;
-
-  // Offer anchor override if we have MegaLoc scores
-  let anchorOverride = null;
-  const matches = (latestProject && latestProject.megaloc_matches) || {};
-  const scoredStems = [...selected].filter(s => matches[s])
-    .sort((a, b) => matches[b].score - matches[a].score);
-  if (scoredStems.length >= 2) {
-    const choices = scoredStems.map(s =>
-      `  ${s} — ${matches[s].score.toFixed(3)} → ${matches[s].shot_key.split('/').pop()}`
-    ).join("\n");
-    const top = scoredStems[0];
-    const picked = prompt(
-      `Anchor photo (MegaLoc top = ${top}, score ${matches[top].score.toFixed(3)}).\n` +
-      `Enter a photo stem to override, or leave blank to auto-pick:\n\n${choices}`,
-      ""
-    );
-    if (picked === null) return;
-    if (picked.trim()) anchorOverride = picked.trim();
-  }
-  const body = {name, photo_stems: [...selected]};
-  if (anchorOverride) body.anchor_override = anchorOverride;
+  // Each photo is registered independently against the reference model
+  // using its own GPS-picked anchor, so there's no shot-wide anchor to
+  // set here. Just name + selected photos.
   const r = await fetch(`/api/projects/${PROJECT_ID}/shots`, {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body),
+    body: JSON.stringify({name, photo_stems: [...selected]}),
   });
   if (!r.ok) {
     alert("Failed to create shot: " + await r.text());
