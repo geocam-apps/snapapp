@@ -32,12 +32,14 @@ CACHE_ROOT = paths.DATA_DIR / "ref_cache"
 CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-def _url() -> str:
+def _url(override: str = None) -> str:
+    if override:
+        return override
     return os.environ.get("SNAPAPP_REF_IMAGES_URL") or str(paths.REF_IMAGES_DIR)
 
 
-def _is_s3() -> bool:
-    return _url().startswith("s3://")
+def _is_s3(url: str = None) -> bool:
+    return _url(url).startswith("s3://")
 
 
 def _cap_bytes() -> int:
@@ -45,14 +47,20 @@ def _cap_bytes() -> int:
     return int(gb * (1024 ** 3))
 
 
-def root_path() -> Path:
+def root_path(url: str = None) -> Path:
     """Local directory to use as the `--images` root for COLMAP subprocess
     calls. For S3 or non-existent local paths this is the on-demand cache;
     for a real local path it's that path directly.
+
+    Optional `url` overrides the env-configured source — used when the
+    pipeline has a specific reference selected per-project.
     """
-    u = _url()
-    if _is_s3():
+    u = _url(url)
+    if _is_s3(u):
         return CACHE_ROOT
+    # Support file:// URLs for registry entries that pin a local path.
+    if u.startswith("file://"):
+        u = u[len("file://"):]
     p = Path(u)
     return p if p.exists() else CACHE_ROOT
 
@@ -131,21 +139,20 @@ def _s3_client():
     return _S3_CLIENT
 
 
-def _fetch_one(rel: str):
+def _fetch_one(rel: str, url: str = None):
     dst = CACHE_ROOT / rel
     if dst.exists():
         _touch(dst)
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
-    u = _url()
-    if _is_s3():
+    u = _url(url)
+    if _is_s3(u):
         bucket, prefix = _parse_s3(u)
         key = f"{prefix}/{rel}" if prefix else rel
         _s3_client().download_file(bucket, key, str(dst))
     else:
-        # Local-but-not-root source (rare path): copy in. The common
-        # case is handled upstream — root_path() returns the source dir
-        # itself and ensure_local is a no-op.
+        if u.startswith("file://"):
+            u = u[len("file://"):]
         src = Path(u) / rel
         if not src.exists():
             raise FileNotFoundError(f"Ref image missing at source: {src}")
@@ -153,22 +160,26 @@ def _fetch_one(rel: str):
     _touch(dst)
 
 
-def ensure_local(rel_paths):
+def ensure_local(rel_paths, images_url: str = None):
     """Make sure every rel path exists under `root_path()` locally.
 
     Returns the local directory suitable to pass as `--images`.
     No-op when the configured source is already the local root.
+
+    `images_url` overrides the env-configured source for this call —
+    e.g. when the pipeline has picked a registry-specific reference.
     """
-    source = Path(_url())
-    if not _is_s3() and source.exists():
-        # Pass-through: images already live at `source` → return as-is.
+    u = _url(images_url)
+    source_str = u[len("file://"):] if u.startswith("file://") else u
+    source = Path(source_str) if not _is_s3(u) else None
+    if source and source.exists():
         return source
     missed = 0
     for rel in rel_paths:
         rel = rel.lstrip("/")
         if not (CACHE_ROOT / rel).exists():
             missed += 1
-        _fetch_one(rel)
+        _fetch_one(rel, url=images_url)
     if missed:
         _evict_lru()
     return CACHE_ROOT

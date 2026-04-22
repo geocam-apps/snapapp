@@ -10,7 +10,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import db, paths, ref_cache, ref_index
+from . import db, paths, ref_cache, ref_index, ref_registry
 
 
 # Both MegaLoc and shotmatch_pose can use the GPU. The GB10's unified-memory
@@ -56,6 +56,23 @@ def log_append(path: Path, msg: str):
         f.write(msg + "\n")
 
 
+def _select_reference_for_project(project: dict) -> dict | None:
+    """Pick the best reference dataset for a project from the registry,
+    based on the shot GPS points in its photo_meta. Returns None when
+    the registry is empty or nothing matches — caller then falls back
+    to the env-configured single reference.
+    """
+    photo_meta = (project.get("meta") or {}).get("photo_meta") or {}
+    pts = []
+    for m in photo_meta.values():
+        lat = m.get("lat"); lon = m.get("lon")
+        if lat is not None and lon is not None:
+            pts.append((float(lat), float(lon)))
+    if not pts:
+        return None
+    return ref_registry.select_for_points(pts)
+
+
 def run_megaloc_for_project(project_id: str) -> dict:
     """Run MegaLoc on all photos in a project, cache result CSV.
 
@@ -78,6 +95,21 @@ def run_megaloc_for_project(project_id: str) -> dict:
     if csv_path.exists():
         return _read_megaloc_csv(csv_path)
 
+    # Pick a reference dataset from the registry based on this project's
+    # shot GPS. Falls back to paths.MEGALOC_DB / paths.MEGALOC_GCDB_DIR
+    # when the registry is empty or nothing geographic matches.
+    ref_entry = _select_reference_for_project(project)
+    if ref_entry:
+        db_dir = ref_entry["faiss_dir"]
+        gcdb_dir = ref_entry.get("gcdb_dir") or str(paths.MEGALOC_GCDB_DIR)
+        log_append(log_path,
+                   f"[megaloc] registry picked '{ref_entry['name']}' "
+                   f"(faiss={db_dir})")
+    else:
+        db_dir = str(paths.MEGALOC_DB)
+        gcdb_dir = str(paths.MEGALOC_GCDB_DIR)
+        log_append(log_path, f"[megaloc] using default db={db_dir}")
+
     cmd = [
         "python3", str(paths.MEGALOC_REPO / "match_photos.py"),
         "--photos", str(photos_dir),
@@ -87,8 +119,8 @@ def run_megaloc_for_project(project_id: str) -> dict:
         # but the correct ref is usually in the top-20 and GPS-filtering
         # will pull it out.
         "--top-k", "20",
-        "--db", str(paths.MEGALOC_DB),
-        "--gcdb-dir", str(paths.MEGALOC_GCDB_DIR),
+        "--db", db_dir,
+        "--gcdb-dir", gcdb_dir,
     ]
     log_append(log_path, f"[megaloc] cmd: {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
@@ -325,47 +357,62 @@ def run_shot(shot_id: str):
 _REF_MODEL_CACHE = None
 
 
-def _load_ref_model_once():
-    """Read the reference COLMAP model once (36k images' metadata, ~50 MB
-    of text). Reused across subprocess calls within the server lifetime.
+def _load_ref_model_once(model_dir=None):
+    """Read the reference COLMAP model (metadata only). When called with
+    `model_dir`, caches per-path; without it, uses the configured
+    paths.REF_MODEL_DIR. Returns None when there's no model on disk
+    (pano-only references).
     """
     global _REF_MODEL_CACHE
-    if _REF_MODEL_CACHE is not None:
-        return _REF_MODEL_CACHE
+    model_dir = Path(model_dir) if model_dir else paths.REF_MODEL_DIR
+    if not model_dir or not model_dir.exists():
+        return None
+    if _REF_MODEL_CACHE is not None and _REF_MODEL_CACHE[0] == str(model_dir):
+        return _REF_MODEL_CACHE[1]
     sys.path.insert(0, str(paths.SHOTMATCH_REPO))
     from colmap_io import read_model
-    _REF_MODEL_CACHE = read_model(paths.REF_MODEL_DIR)
-    return _REF_MODEL_CACHE
+    data = read_model(model_dir)
+    _REF_MODEL_CACHE = (str(model_dir), data)
+    return data
 
 
-def _fetch_ref_images_for_run(matched_shot_id, matched_capture, n_neighbors=15):
+def _fetch_ref_images_for_run(matched_shot_id, matched_capture,
+                               n_neighbors=15, model_dir=None, images_url=None):
     """Make sure every ref image the SFM subprocess needs is present in the
     local cache. Returns the local directory to pass as `--images`.
 
-    Bounds what we localize: only the matched shot (3 images) plus its
-    n_neighbors nearest shots (another ~45 images) — never the full ref
-    set, which can be hundreds of GB.
+    Bounds what we localize: only the matched shot plus its n_neighbors
+    nearest shots (another ~45 images) — never the full ref set.
+
+    When `model_dir` / `images_url` are given (e.g. chosen from the
+    registry), uses them for model lookup + cache source instead of the
+    env-configured defaults.
     """
     sys.path.insert(0, str(paths.SHOTMATCH_REPO))
     from register_photo import find_images_for_shot, find_nearby_shots
 
-    _, imgs, _ = _load_ref_model_once()
+    loaded = _load_ref_model_once(model_dir)
+    if loaded is None:
+        return ref_cache.root_path(images_url)
+    _, imgs, _ = loaded
     matched_ids = find_images_for_shot(imgs, matched_shot_id, matched_capture)
     if not matched_ids:
-        # fall back: return the configured root; subprocess will fail
-        # with a clearer error than "S3 key not found".
-        return ref_cache.root_path()
+        return ref_cache.root_path(images_url)
     keep_ids = find_nearby_shots(imgs, matched_ids, n_neighbors)
     rel_names = [imgs[i].name for i in keep_ids]
-    return ref_cache.ensure_local(rel_names)
+    return ref_cache.ensure_local(rel_names, images_url=images_url)
 
 
 def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
                             anchor_shot_id, anchor_capture, shot_out_dir,
-                            n_shots_neighbours=15):
+                            n_shots_neighbours=15, ref_entry=None):
     """Multi-photo SFM via register_sequence_natural.py."""
+    model_dir = Path(ref_entry["model_dir"]) if ref_entry and ref_entry.get("model_dir") \
+                else paths.REF_MODEL_DIR
+    images_url = (ref_entry or {}).get("images_url")
     images_root = _fetch_ref_images_for_run(
         anchor_shot_id, anchor_capture, n_shots_neighbours,
+        model_dir=model_dir, images_url=images_url,
     )
     log_append(log_path, f"[sfm] ref images root: {images_root}")
     cmd = [
@@ -374,7 +421,7 @@ def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
         "--photos-dir", str(staging_dir),
         "--anchor", f"{anchor_stem}={anchor_shot_id}",
         "--capture", anchor_capture or "",
-        "--model", str(paths.REF_MODEL_DIR),
+        "--model", str(model_dir),
         "--images", str(images_root),
         "--output", str(shot_out_dir),
         "--camera-model", "OPENCV",
@@ -413,7 +460,7 @@ def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
 
 
 def _run_register_independent(shot_id, log_path, staging_dir, matches,
-                               photo_stems, shot_out_dir):
+                               photo_stems, shot_out_dir, ref_entry=None):
     """Register each phone photo independently against the reference model.
 
     This is the right default for SnapApp-style captures: individual
@@ -479,21 +526,21 @@ def _run_register_independent(shot_id, log_path, staging_dir, matches,
             progress=frac,
         )
 
+        model_dir = Path(ref_entry["model_dir"]) if ref_entry and ref_entry.get("model_dir") \
+                    else paths.REF_MODEL_DIR
+        images_url = (ref_entry or {}).get("images_url")
         images_root = _fetch_ref_images_for_run(
             anchor_shot_id, anchor_capture, n_neighbors=10,
+            model_dir=model_dir, images_url=images_url,
         )
         cmd = [
             "python3", "-u", str(paths.SHOTMATCH_REPO / "register_photo.py"),
             "--photo", str(photo_path),
-            "--model", str(paths.REF_MODEL_DIR),
+            "--model", str(model_dir),
             "--images", str(images_root),
             "--matched-shot", anchor_shot_id,
             "--capture", anchor_capture,
             "--output", str(mini_dir),
-            # 'fallback' tries strict → aggressive → max in register_photo
-            # until one registers. Trades accuracy for yield — the right
-            # call here since MegaLoc+GPS have already pinned the general
-            # location and an "almost" pose still lands in the right area.
             "--profile", "fallback",
         ]
         log_append(log_path, f"[sfm] ({i+1}/{len(photo_stems)}) {stem} "
@@ -606,7 +653,8 @@ def _run_register_independent(shot_id, log_path, staging_dir, matches,
 
 
 def _run_register_photo(shot_id, log_path, photo_path, anchor_stem,
-                         anchor_shot_id, anchor_capture, shot_out_dir):
+                         anchor_shot_id, anchor_capture, shot_out_dir,
+                         ref_entry=None):
     """Single-photo PnP via register_photo.py.
 
     That script doesn't emit phase markers like the sequence pipeline, so
@@ -614,13 +662,17 @@ def _run_register_photo(shot_id, log_path, photo_path, anchor_stem,
     with the viewer. Copies the query image into `shot_out_dir/images/` so
     the three.js scene endpoint can serve it.
     """
+    model_dir = Path(ref_entry["model_dir"]) if ref_entry and ref_entry.get("model_dir") \
+                else paths.REF_MODEL_DIR
+    images_url = (ref_entry or {}).get("images_url")
     images_root = _fetch_ref_images_for_run(
         anchor_shot_id, anchor_capture or None, n_neighbors=10,
+        model_dir=model_dir, images_url=images_url,
     )
     cmd = [
         "python3", "-u", str(paths.SHOTMATCH_REPO / "register_photo.py"),
         "--photo", str(photo_path),
-        "--model", str(paths.REF_MODEL_DIR),
+        "--model", str(model_dir),
         "--images", str(images_root),
         "--matched-shot", anchor_shot_id,
         "--capture", anchor_capture or "",
@@ -786,6 +838,19 @@ def _process_shot(shot_id: str):
         db.update_shot(shot_id, phase="sfm", phase_label="Preparing SFM",
                        progress=0.15, n_queries=len(photo_files))
 
+        # Re-select the same reference the MegaLoc step used so the SFM
+        # subprocess gets the matching model dir + image source. When no
+        # registry entry matches, env-configured defaults apply.
+        ref_entry = _select_reference_for_project(project)
+        if ref_entry:
+            log_append(log_path, f"[sfm] reference '{ref_entry['name']}'")
+            if not ref_entry.get("model_dir"):
+                raise RuntimeError(
+                    f"Reference '{ref_entry['name']}' has no COLMAP model "
+                    f"— MegaLoc can match into it but SFM registration "
+                    f"requires a --model path."
+                )
+
         # Mode dispatch:
         #   single photo                            → register_photo.py (PnP)
         #   bundle from one phone shot (default)    → register_sequence_natural
@@ -801,17 +866,19 @@ def _process_shot(shot_id: str):
             _run_register_photo(
                 shot_id, log_path, anchor_photo, anchor_stem,
                 anchor_shot_id, anchor_capture, shot_out_dir,
+                ref_entry=ref_entry,
             )
         elif meta.get("sfm_mode") == "independent":
             _run_register_independent(
                 shot_id, log_path, staging_dir, matches, photo_stems,
-                shot_out_dir,
+                shot_out_dir, ref_entry=ref_entry,
             )
         else:
             _run_register_sequence(
                 shot_id, log_path, staging_dir, anchor_stem,
                 anchor_shot_id, anchor_capture, shot_out_dir,
                 n_shots_neighbours=int(meta.get("n_shots") or 15),
+                ref_entry=ref_entry,
             )
 
         summary_path = shot_out_dir / "sequence.json"
