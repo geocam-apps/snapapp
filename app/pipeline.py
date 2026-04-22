@@ -90,10 +90,8 @@ def run_megaloc_for_project(project_id: str) -> dict:
         # photos/ directly.
         photos_dir = paths.project_photos_dir(project_id)
     csv_path = paths.project_megaloc_csv(project_id)
+    ref_sidecar = csv_path.with_suffix(".ref")
     log_path = paths.project_dir(project_id) / "megaloc.log"
-
-    if csv_path.exists():
-        return _read_megaloc_csv(csv_path)
 
     # Pick a reference dataset from the registry based on this project's
     # shot GPS. Falls back to paths.MEGALOC_DB / paths.MEGALOC_GCDB_DIR
@@ -102,13 +100,28 @@ def run_megaloc_for_project(project_id: str) -> dict:
     if ref_entry:
         db_dir = ref_entry["faiss_dir"]
         gcdb_dir = ref_entry.get("gcdb_dir") or str(paths.MEGALOC_GCDB_DIR)
-        log_append(log_path,
-                   f"[megaloc] registry picked '{ref_entry['name']}' "
-                   f"(faiss={db_dir})")
+        ref_key = ref_entry["name"]
     else:
         db_dir = str(paths.MEGALOC_DB)
         gcdb_dir = str(paths.MEGALOC_GCDB_DIR)
-        log_append(log_path, f"[megaloc] using default db={db_dir}")
+        ref_key = f"env:{db_dir}"
+
+    # Invalidate the cached CSV if it was produced against a different
+    # reference (e.g. the project was re-uploaded after a registry change,
+    # or started as a Lomita match but now gets matched to Costa Mesa).
+    if csv_path.exists():
+        cached_ref = ref_sidecar.read_text().strip() if ref_sidecar.exists() else ""
+        if cached_ref != ref_key:
+            log_append(log_path,
+                       f"[megaloc] cached CSV was for {cached_ref or '(unknown)'} "
+                       f"but registry now picks {ref_key}; re-running")
+            csv_path.unlink()
+            if ref_sidecar.exists():
+                ref_sidecar.unlink()
+        else:
+            return _read_megaloc_csv(csv_path)
+
+    log_append(log_path, f"[megaloc] using reference '{ref_key}' (faiss={db_dir})")
 
     cmd = [
         "python3", str(paths.MEGALOC_REPO / "match_photos.py"),
@@ -131,6 +144,9 @@ def run_megaloc_for_project(project_id: str) -> dict:
         log_append(log_path, f"[megaloc] stderr:\n{proc.stderr[-2000:]}")
         raise RuntimeError(f"MegaLoc failed: {proc.stderr[-500:]}")
 
+    # Record which reference produced this CSV so a later reference
+    # change invalidates the cache instead of reusing stale matches.
+    ref_sidecar.write_text(ref_key)
     return _read_megaloc_csv(csv_path)
 
 
@@ -401,6 +417,139 @@ def _fetch_ref_images_for_run(matched_shot_id, matched_capture,
     keep_ids = find_nearby_shots(imgs, matched_ids, n_neighbors)
     rel_names = [imgs[i].name for i in keep_ids]
     return ref_cache.ensure_local(rel_names, images_url=images_url)
+
+
+def _load_pano_positions(ref_entry: dict) -> dict:
+    """For a pano-based reference, load PanoPositions.csv (if present at
+    the images_url root) into a {pano_key: {lat, lon, elev, heading}} map.
+    Pano key matches the rel path MegaLoc stored minus any _<azim>.jpg
+    suffix, so shot_key lookups work directly.
+
+    Returns an empty dict when no CSV is available.
+    """
+    if not ref_entry:
+        return {}
+    url = ref_entry.get("images_url") or ""
+    if url.startswith("file://"):
+        base = Path(url[len("file://"):])
+    else:
+        # S3-hosted pano refs aren't supported here (we'd need to fetch
+        # the CSV); return empty and fall back to phone GPS.
+        base = None
+    if base is None or not base.exists():
+        return {}
+    csv_path = base / "PanoPositions.csv"
+    if not csv_path.exists():
+        return {}
+    import csv as _csv
+    out = {}
+    with open(csv_path) as f:
+        reader = _csv.DictReader(f, skipinitialspace=True)
+        for row in reader:
+            idx = row.get("index") or ""
+            try:
+                lat = float(row.get("lat") or row.get("latitude"))
+                lon = float(row.get("lon") or row.get("longitude"))
+            except (TypeError, ValueError):
+                continue
+            elev = row.get("elev")
+            heading = row.get("heading")
+            try: elev = float(elev) if elev not in (None, "") else None
+            except ValueError: elev = None
+            try: heading = float(heading) if heading not in (None, "") else None
+            except ValueError: heading = None
+            # Use stem of the pano file as the key (matches shot_key of
+            # split_pano layout: `capture/<stem>`).
+            key = Path(idx).stem
+            out[key] = {"lat": lat, "lon": lon, "elev": elev, "heading": heading,
+                        "capture": Path(idx).parts[0] if "/" in idx else None}
+    return out
+
+
+def _emit_megaloc_only_result(shot_id, log_path, shot_out_dir, meta, matches,
+                               photo_stems, ref_entry):
+    """Write a sequence.json that records each query's MegaLoc-matched pano
+    (with the pano's known lat/lon/heading) so the viewer can pin query
+    cameras at their matched locations — no 3D reconstruction, no model/
+    dir. Used for pano-only reference datasets.
+    """
+    pano_pos = _load_pano_positions(ref_entry)
+    if pano_pos:
+        log_append(log_path, f"[sfm] loaded {len(pano_pos)} pano positions")
+    else:
+        log_append(log_path, "[sfm] no PanoPositions.csv — "
+                             "queries will have no coordinates")
+
+    queries = []
+    failed = []
+    for stem in photo_stems:
+        m = matches.get(stem)
+        if not m:
+            # A shot's wide key looks like the bundle dir name. The
+            # photo_stems here include burst/mid too; only the wide
+            # actually got MegaLoc'd, so we also look up via shot_dir.
+            continue
+        pick = m.get("gps_best") or (m.get("top_k") or [m])[0]
+        shot_key = pick.get("shot_key") or ""
+        shot_id_str = Path(shot_key).stem  # e.g. 00006692
+        pos = pano_pos.get(shot_id_str)
+        q = {
+            "stem": stem,
+            "image_name": f"query/{stem}.jpg",
+            "match": {
+                "shot_key": shot_key,
+                "score": pick.get("score"),
+                "distance_m": pick.get("distance_m"),
+                "ref_lat": pick.get("ref_lat"),
+                "ref_lon": pick.get("ref_lon"),
+            },
+        }
+        if pos:
+            q["latlon"] = {"lat": pos["lat"], "lon": pos["lon"],
+                           "alt": pos.get("elev")}
+            q["bearing"] = pos.get("heading")
+        queries.append(q)
+
+    # Attach the full bundle (wide+mid+burst) by walking meta.photo_names
+    # so the UI can show every photo, not just ones MegaLoc saw (the
+    # burst frames never go through MegaLoc; the wide is the one keyed).
+    wide_stem = meta.get("wide_stem") or "wide"
+    wide_match = matches.get(meta.get("shot_dir") or wide_stem)
+    if wide_match:
+        pick = wide_match.get("gps_best") or (wide_match.get("top_k") or [wide_match])[0]
+        shot_key = pick.get("shot_key") or ""
+        shot_id_str = Path(shot_key).stem
+        pos = pano_pos.get(shot_id_str)
+        for name in meta.get("photo_names") or []:
+            stem = Path(name).stem
+            if any(q["stem"] == stem for q in queries):
+                continue
+            q = {"stem": stem, "image_name": f"query/{stem}.jpg",
+                 "match": {"shot_key": shot_key,
+                           "score": pick.get("score"),
+                           "distance_m": pick.get("distance_m")}}
+            if pos:
+                q["latlon"] = {"lat": pos["lat"], "lon": pos["lon"],
+                               "alt": pos.get("elev")}
+                q["bearing"] = pos.get("heading")
+            queries.append(q)
+
+    summary = {
+        "sequence_name": Path(shot_out_dir).name,
+        "method": f"MegaLoc-only (pano reference '{ref_entry.get('name')}')",
+        "n_queries": len(meta.get("photo_names") or []),
+        "n_registered": len(queries),
+        "failed": failed,
+        "anchors": {},
+        "queries": queries,
+        "reference": {
+            "name": ref_entry.get("name"),
+            "kind": "pano_only",
+        },
+    }
+    shot_out_dir.mkdir(parents=True, exist_ok=True)
+    with open(shot_out_dir / "sequence.json", "w") as f:
+        json.dump(summary, f, indent=2)
 
 
 def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
@@ -844,12 +993,34 @@ def _process_shot(shot_id: str):
         ref_entry = _select_reference_for_project(project)
         if ref_entry:
             log_append(log_path, f"[sfm] reference '{ref_entry['name']}'")
-            if not ref_entry.get("model_dir"):
-                raise RuntimeError(
-                    f"Reference '{ref_entry['name']}' has no COLMAP model "
-                    f"— MegaLoc can match into it but SFM registration "
-                    f"requires a --model path."
-                )
+
+        # If the matched reference has no COLMAP model (pano-only dataset),
+        # we can't run SFM. Emit a MegaLoc-only result so the user sees
+        # which reference panos each query matched — that's the location.
+        if ref_entry and not ref_entry.get("model_dir"):
+            log_append(log_path,
+                       "[sfm] reference has no COLMAP model; writing "
+                       "MegaLoc-only location output (no 3D reconstruction)")
+            _emit_megaloc_only_result(
+                shot_id, log_path, shot_out_dir, meta, matches, photo_stems,
+                ref_entry,
+            )
+            summary = json.load(open(shot_out_dir / "sequence.json"))
+            n_reg = summary.get("n_registered", 0)
+            db.update_shot(
+                shot_id, status="done", phase="done",
+                phase_label="Located (MegaLoc only)",
+                progress=1.0,
+                n_registered=n_reg, n_queries=len(photo_files),
+                error=None,
+                meta={**meta,
+                      "anchor_stem": anchor_stem_in_bundle,
+                      "anchor_shot_key": anchor_info["shot_key"],
+                      "anchor_capture": anchor_capture,
+                      "sfm_skipped_reason": "no_colmap_model",
+                      "n_photos": len(photo_files)},
+            )
+            return
 
         # Mode dispatch:
         #   single photo                            → register_photo.py (PnP)

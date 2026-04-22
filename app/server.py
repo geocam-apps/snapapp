@@ -974,8 +974,78 @@ def api_shot_scene(shot_id):
         abort(404)
     output_dir = paths.shot_output_dir(shot["project_id"], shot_id)
     model_dir = output_dir / "model"
+    summary_path = output_dir / "sequence.json"
+
+    # Pano-only references produce a sequence.json but no COLMAP model.
+    # Return a MegaLoc-only scene: per-query cameras at their matched
+    # pano's GPS, projected into a local ENU-like meters frame so the
+    # three.js viewer can draw frustums at roughly the right positions.
     if not model_dir.exists():
-        abort(404, "No model yet")
+        if not summary_path.exists():
+            abort(404, "No model or sequence.json yet")
+        with open(summary_path) as f:
+            summary = json.load(f)
+        import math
+        qs = [q for q in (summary.get("queries") or [])
+              if q.get("latlon", {}).get("lat") is not None
+              and q.get("latlon", {}).get("lon") is not None]
+        if not qs:
+            return jsonify({
+                "shot_id": shot_id, "kind": "megaloc_only",
+                "cameras": [], "points": [], "summary": summary,
+            })
+        lat0 = sum(q["latlon"]["lat"] for q in qs) / len(qs)
+        lon0 = sum(q["latlon"]["lon"] for q in qs) / len(qs)
+        mx = 111320.0 * math.cos(math.radians(lat0))  # m per degree lon
+        my = 110540.0                                   # m per degree lat
+        shot_meta = shot.get("meta") or {}
+        shot_dir = shot_meta.get("shot_dir")
+
+        def _image_url(stem):
+            if shot_dir:
+                return f"/api/projects/{shot['project_id']}/photo/{shot_dir}/{stem}.jpg"
+            return f"/api/shots/{shot_id}/image/{stem}"
+
+        cameras_out = []
+        for q in qs:
+            ll = q["latlon"]
+            x = (ll["lon"] - lon0) * mx
+            y = (ll["lat"] - lat0) * my
+            z = (ll.get("alt") or 0) - 0  # we don't know a datum; 0 is fine
+            bearing = q.get("bearing") or 0.0
+            # Camera orientation: R is world→camera. Start with camera
+            # looking +Y (north), rotate about Z by -bearing so +bearing
+            # sends it clockwise from north (compass convention).
+            br = math.radians(bearing)
+            cos_b, sin_b = math.cos(br), math.sin(br)
+            # Build a simple rotation — place Z up, camera looking
+            # horizontally along the bearing direction.
+            rotation = [
+                [cos_b, -sin_b, 0.0],
+                [0.0,    0.0,   -1.0],
+                [sin_b,  cos_b, 0.0],
+            ]
+            cameras_out.append({
+                "name": f"query/{q['stem']}.jpg",
+                "stem": q["stem"],
+                "center": [x, y, z],
+                "rotation": rotation,
+                "width": 1920, "height": 1080,
+                "fx": 1600, "fy": 1600, "cx": 960, "cy": 540,
+                "is_query": True, "is_anchor": False,
+                "image_url": _image_url(q["stem"]),
+                "num_observations": 0,
+                "match": q.get("match"),
+                "lat": ll["lat"], "lon": ll["lon"],
+            })
+        return jsonify({
+            "shot_id": shot_id,
+            "kind": "megaloc_only",
+            "cameras": cameras_out,
+            "points": [],
+            "summary": summary,
+            "geo_origin": {"lat": lat0, "lon": lon0},
+        })
 
     from colmap_io import read_model, qvec_to_rotmat, image_center
 
