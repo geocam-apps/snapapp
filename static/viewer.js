@@ -257,35 +257,16 @@ document.getElementById("frustumDepth").addEventListener("input", () => {
   if (sceneData) { render(); requestRender(); }
 });
 
-// Render-on-demand. A continuous rAF loop works on most browsers but
-// Firefox on Asahi Linux sometimes stalls the compositor present — the
-// canvas draws but doesn't appear on screen until a tab-focus reflow
-// wakes it up. Explicit invalidate + conditional render forces each
-// interaction to produce a visible frame.
-let _needsRender = true;
-function requestRender() { _needsRender = true; }
-
-controls.addEventListener("change", requestRender);
-controls.addEventListener("start", requestRender);
-controls.addEventListener("end", requestRender);
-window.addEventListener("resize", () => { resize(); requestRender(); });
-window.addEventListener("focus", requestRender);
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) requestRender();
-});
-
+// Simple always-render rAF loop — works on every browser we care about.
 function animate() {
-  // OrbitControls with damping keeps updating for a few frames after
-  // the user lets go — its update() returns true while still animating.
-  const stillMoving = controls.update();
-  if (stillMoving) _needsRender = true;
-  if (_needsRender) {
-    renderer.render(scene, camera);
-    _needsRender = false;
-  }
+  controls.update();
+  renderer.render(scene, camera);
   requestAnimationFrame(animate);
 }
 animate();
+
+// No-op kept as a stub because a few other call sites still call it.
+function requestRender() {}
 
 function escapeHtml(s) {
   if (s == null) return "";
