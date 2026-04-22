@@ -18,7 +18,7 @@ try:
 except ImportError:
     pass
 
-from app import db, paths, pipeline, gcdb_read
+from app import db, paths, pipeline, gcdb_read, geocam_api
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
@@ -729,6 +729,63 @@ def api_create_shot(project_id):
         meta["anchor_override"] = anchor_override
     sid = db.create_shot(project_id, name, meta=meta)
     return jsonify({"shot_id": sid})
+
+
+@app.route("/api/projects/<project_id>/cells-search", methods=["POST"])
+def api_project_cells_search(project_id):
+    """Ask the GeoCam manager-api which `cells` contain this project's shots.
+
+    Gathers every (lat, lon) from the project's photo_meta, calls
+    geocam_api.search_cells_for_points, and returns the matching cells
+    along with the URLs a user can click to jump into a training
+    workflow for each.
+
+    The workflow URL pattern is env-driven so the user can fill it in
+    later: SNAPAPP_GEOCAM_WORKFLOW_URL defaults to a placeholder; the
+    {cell_slug}, {cell_map_slug}, {project_slug} placeholders are
+    substituted per match.
+    """
+    p = db.get_project(project_id)
+    if p is None:
+        abort(404)
+
+    photo_meta = (p.get("meta") or {}).get("photo_meta") or {}
+    # One lat/lon per photo, deduped (multiple photos per shot share coords).
+    seen = set()
+    points = []
+    for meta in photo_meta.values():
+        lat = meta.get("lat"); lon = meta.get("lon")
+        if lat is None or lon is None:
+            continue
+        key = (round(lon, 6), round(lat, 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        points.append((float(lon), float(lat)))
+
+    if not points:
+        return jsonify({"ok": False,
+                        "error": "Project has no photos with GPS"}), 400
+
+    result = geocam_api.search_cells_for_points(points)
+
+    # Attach workflow URLs
+    import os
+    url_tmpl = os.environ.get(
+        "SNAPAPP_GEOCAM_WORKFLOW_URL",
+        "https://manager-ui.geocam.io/cells/{cell_slug}",
+    )
+    for c in result.get("cells", []) or []:
+        try:
+            c["workflow_url"] = url_tmpl.format(
+                cell_slug=c.get("slug") or "",
+                cell_map_slug=c.get("cell_map_slug") or "",
+                project_slug=c.get("project_slug") or "",
+            )
+        except KeyError:
+            c["workflow_url"] = url_tmpl  # unknown placeholder — leave as-is
+
+    return jsonify(result)
 
 
 @app.route("/api/projects/<project_id>/run", methods=["POST"])

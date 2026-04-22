@@ -295,6 +295,65 @@ document.getElementById("runAllBtn").addEventListener("click", async () => {
   alert(`Queued ${data.count} shot(s).`);
 });
 
+document.getElementById("searchCellsBtn").addEventListener("click", async () => {
+  const modal = document.getElementById("cellsModal");
+  const body = document.getElementById("cellsBody");
+  modal.style.display = "";
+  body.textContent = "Searching…";
+  let data;
+  try {
+    const r = await fetch(`/api/projects/${PROJECT_ID}/cells-search`, {method: "POST"});
+    data = await r.json();
+    if (!r.ok && !data.error) data.error = `HTTP ${r.status}`;
+  } catch (e) {
+    body.innerHTML = `<div style="color:#991b1b">Request failed: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  renderCellsResult(data);
+});
+
+function renderCellsResult(data) {
+  const body = document.getElementById("cellsBody");
+  const bits = [];
+  if (!data.ok) {
+    bits.push(`<div style="color:#991b1b">${escapeHtml(data.error || "Search failed.")}</div>`);
+  }
+  const cells = data.cells || [];
+  if (cells.length === 0 && data.ok) {
+    bits.push(`<div>No cells contain any of this project's shot points.</div>`);
+  }
+  for (const c of cells) {
+    bits.push(`
+      <div class="cell">
+        <div class="name">${escapeHtml(c.name || c.slug)}</div>
+        <div class="sub">
+          slug: <code>${escapeHtml(c.slug)}</code>
+          ${c.address ? `· ${escapeHtml(c.address)}` : ""}
+          ${c.reference ? `· ref ${escapeHtml(c.reference)}` : ""}
+        </div>
+        <div class="sub">
+          ${c.matched_points ? `${c.matched_points.length} matched point(s)` : ""}
+          ${c.cell_map_slug ? `· collection <code>${escapeHtml(c.cell_map_slug)}</code>` : ""}
+          ${c.project_slug ? `· project <code>${escapeHtml(c.project_slug)}</code>` : ""}
+        </div>
+        <div class="actions">
+          <a href="${c.workflow_url}" target="_blank" rel="noopener">
+            <button class="small">Open workflow</button></a>
+        </div>
+      </div>`);
+  }
+  const diag = [];
+  if (data.strategy) diag.push(`strategy: ${data.strategy}`);
+  if (data.tried) diag.push(`tried: ${data.tried.join(" · ")}`);
+  if (data.points) diag.push(`queried ${data.points.length} point(s)`);
+  if (diag.length) bits.push(`<div class="diag">${escapeHtml(diag.join("\n"))}</div>`);
+  body.innerHTML = bits.join("\n");
+}
+
+document.getElementById("cellsCloseBtn").addEventListener("click", () => {
+  document.getElementById("cellsModal").style.display = "none";
+});
+
 document.getElementById("deleteProjectBtn").addEventListener("click", async () => {
   if (!confirm("Delete this entire project and all shots? This cannot be undone.")) return;
   await fetch(`/api/projects/${PROJECT_ID}`, {method: "DELETE"});

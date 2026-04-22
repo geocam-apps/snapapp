@@ -22,6 +22,7 @@
         <span id="selCount" class="meta" style="margin-right:8px"></span>
         <button id="runSelectedBtn" class="small" disabled>Run selected</button>
         <button id="runAllBtn" class="small secondary">Run all pending</button>
+        <button id="searchCellsBtn" class="small secondary">Find GeoCam cells</button>
         <a id="combinedSceneBtn" class="small" style="display:none"
            href="#"><button class="small">Combined 3D scene</button></a>
       </div>
@@ -48,6 +49,16 @@
   <section class="danger">
     <button id="deleteProjectBtn" class="danger">Delete project</button>
   </section>
+
+  <div id="cellsModal" class="modal" style="display:none">
+    <div class="modal-inner">
+      <div class="modal-hdr">
+        <h3>GeoCam cells containing your shots</h3>
+        <button id="cellsCloseBtn" class="small secondary">Close</button>
+      </div>
+      <div id="cellsBody" class="modal-body">Searching…</div>
+    </div>
+  </div>
 </main>
 
 <script>window.PROJECT_ID = location.pathname.split("/")[2];</script>
