@@ -108,7 +108,11 @@ function buildBillboard(cam, depth, texUrl, opacity=1.0) {
   const uvs = [0,1, 1,1, 1,0, 0,1, 1,0, 0,0];
   geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geom.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-  const tex = new THREE.TextureLoader().load(texUrl);
+  const tex = new THREE.TextureLoader().load(texUrl, () => {
+    // Texture finishes loading after the initial render — kick one so
+    // the billboard actually shows up without waiting for user input.
+    requestRender();
+  });
   tex.colorSpace = THREE.SRGBColorSpace;
   const mat = new THREE.MeshBasicMaterial({map: tex, side: THREE.DoubleSide,
                                             transparent: opacity < 1, opacity});
@@ -243,18 +247,42 @@ function applyToggles() {
   groups.refFrustums.visible = document.getElementById("showRefFrustums").checked;
   groups.refImages.visible = document.getElementById("showRefImages").checked;
   groups.queryImage.visible = document.getElementById("showQueryImages").checked;
+  requestRender();
 }
 
 ["showPoints", "showRefFrustums", "showRefImages", "showQueryImages"].forEach(id =>
   document.getElementById(id).addEventListener("change", applyToggles));
 
 document.getElementById("frustumDepth").addEventListener("input", () => {
-  if (sceneData) render();
+  if (sceneData) { render(); requestRender(); }
+});
+
+// Render-on-demand. A continuous rAF loop works on most browsers but
+// Firefox on Asahi Linux sometimes stalls the compositor present — the
+// canvas draws but doesn't appear on screen until a tab-focus reflow
+// wakes it up. Explicit invalidate + conditional render forces each
+// interaction to produce a visible frame.
+let _needsRender = true;
+function requestRender() { _needsRender = true; }
+
+controls.addEventListener("change", requestRender);
+controls.addEventListener("start", requestRender);
+controls.addEventListener("end", requestRender);
+window.addEventListener("resize", () => { resize(); requestRender(); });
+window.addEventListener("focus", requestRender);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) requestRender();
 });
 
 function animate() {
-  controls.update();
-  renderer.render(scene, camera);
+  // OrbitControls with damping keeps updating for a few frames after
+  // the user lets go — its update() returns true while still animating.
+  const stillMoving = controls.update();
+  if (stillMoving) _needsRender = true;
+  if (_needsRender) {
+    renderer.render(scene, camera);
+    _needsRender = false;
+  }
   requestAnimationFrame(animate);
 }
 animate();
