@@ -379,6 +379,9 @@ def _run_register_sequence(shot_id, log_path, staging_dir, anchor_stem,
         "--output", str(shot_out_dir),
         "--camera-model", "OPENCV",
         "--n-shots", str(n_shots_neighbours),
+        # Force one camera per zoom role (wide / mid / burst) regardless
+        # of EXIF — snapapp's 7-photo bundles always have this structure.
+        "--group-mode", "role",
     ]
     log_append(log_path, f"[sfm] cmd: {' '.join(cmd)}")
     proc = subprocess.Popen(
