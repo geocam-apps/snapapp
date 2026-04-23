@@ -15,15 +15,15 @@ from pathlib import Path
 from . import paths
 
 
-def _cache_path() -> Path:
-    # Hash the model dir so switching REF_MODEL_DIR invalidates the cache
-    # automatically instead of silently reusing stale geographic indices.
+def _cache_path(model_dir=None) -> Path:
     import hashlib
-    h = hashlib.sha1(str(paths.REF_MODEL_DIR).encode()).hexdigest()[:12]
+    target = Path(model_dir) if model_dir else paths.REF_MODEL_DIR
+    h = hashlib.sha1(str(target).encode()).hexdigest()[:12]
     return paths.DATA_DIR / f"ref_index.{h}.json"
 
 
-_MEM_CACHE = None
+# Memoized per model_dir so switching references doesn't thrash.
+_MEM_CACHES: dict = {}
 
 
 def _crs_info():
@@ -47,13 +47,31 @@ def _crs_info():
     return {"epsg": epsg, "offset": offset}
 
 
-def _build_index():
-    """Walk the COLMAP reference model → `{shot_key: {lat, lon, alt}}`."""
+def _crs_info_for(model_dir: Path):
+    crs_json = Path(model_dir).parent / "crs.json"
+    if not crs_json.exists():
+        return None
+    with open(crs_json) as f:
+        j = json.load(f)
+    pose = j.get("crsPose") or []
+    if len(pose) < 12:
+        return None
+    offset = tuple(pose[-3:])
+    matches = re.findall(r'AUTHORITY\["EPSG","(\d+)"\]', j.get("crs", ""))
+    epsg = int(matches[-1]) if matches else 32611
+    return {"epsg": epsg, "offset": offset}
+
+
+def _build_index(model_dir=None):
+    """Walk a COLMAP reference model → `{shot_key: {lat, lon, alt}}`."""
     try:
         import pyproj
     except ImportError:
         return {}
-    crs = _crs_info()
+    target = Path(model_dir) if model_dir else paths.REF_MODEL_DIR
+    if not target.exists():
+        return {}
+    crs = _crs_info_for(target)
     if crs is None:
         return {}
 
@@ -61,7 +79,7 @@ def _build_index():
     sys.path.insert(0, str(Path.home() / "shotmatch_pose"))
     from colmap_io import read_model, image_center
 
-    cams, imgs, _ = read_model(paths.REF_MODEL_DIR)
+    cams, imgs, _ = read_model(target)
     transformer = pyproj.Transformer.from_crs(crs["epsg"], 4326, always_xy=True)
     ox, oy, _ = crs["offset"]
 
@@ -86,28 +104,34 @@ def _build_index():
     return out
 
 
-def load():
-    """Return the full ref index, loading or building as needed."""
-    global _MEM_CACHE
-    if _MEM_CACHE is not None:
-        return _MEM_CACHE
-    cp = _cache_path()
+def load(model_dir=None):
+    """Return the ref index for `model_dir` (defaults to paths.REF_MODEL_DIR).
+    Per-model_dir in-memory cache + on-disk cache; changing which reference
+    you ask about doesn't thrash either one.
+    """
+    target = Path(model_dir) if model_dir else paths.REF_MODEL_DIR
+    key = str(target)
+    if key in _MEM_CACHES:
+        return _MEM_CACHES[key]
+    cp = _cache_path(target)
     if cp.exists():
         try:
             with open(cp) as f:
-                _MEM_CACHE = json.load(f)
-            return _MEM_CACHE
+                idx = json.load(f)
+            _MEM_CACHES[key] = idx
+            return idx
         except Exception:
             pass
-    _MEM_CACHE = _build_index()
+    idx = _build_index(target)
+    _MEM_CACHES[key] = idx
     cp.parent.mkdir(parents=True, exist_ok=True)
     with open(cp, "w") as f:
-        json.dump(_MEM_CACHE, f)
-    return _MEM_CACHE
+        json.dump(idx, f)
+    return idx
 
 
-def lookup(shot_key):
-    idx = load()
+def lookup(shot_key, model_dir=None):
+    idx = load(model_dir)
     return idx.get(shot_key)
 
 

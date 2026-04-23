@@ -172,15 +172,16 @@ def _read_megaloc_csv(csv_path: Path) -> dict:
     return out
 
 
-def _annotate_matches_with_gps(matches: dict, photo_meta: dict) -> dict:
+def _annotate_matches_with_gps(matches: dict, photo_meta: dict,
+                                model_dir=None) -> dict:
     """For each photo's top-K MegaLoc matches, compute the distance from the
     phone's reported GPS to the reference shot's known lat/lon, and mark
     which matches fall inside the phone's accuracy radius.
 
-    Mutates `matches` in place; returns it for convenience. Does nothing if
-    the ref_index isn't available.
+    `model_dir` selects which reference geography to use; defaults to the
+    env-configured one. Mutates `matches` in place.
     """
-    idx = ref_index.load()
+    idx = ref_index.load(model_dir)
     if not idx:
         return matches
     for stem, m in matches.items():
@@ -227,7 +228,7 @@ def _annotate_matches_with_gps(matches: dict, photo_meta: dict) -> dict:
 
 
 def _choose_anchor(matches: dict, photo_stems: list,
-                   pinned_stem: str = None) -> tuple:
+                   pinned_stem: str = None, model_dir=None) -> tuple:
     """Pick (anchor_stem, chosen_match_dict) for the shotmatch_pose subprocess.
 
     Strategy, in order:
@@ -277,7 +278,7 @@ def _choose_anchor(matches: dict, photo_stems: list,
     # Pick each photo's NEAREST ref shot (from the full ref_index) and
     # keep the single closest one across all photos. MegaLoc isn't
     # picking here; geography is.
-    gps_pick = _nearest_ref_by_gps(photo_stems, matches)
+    gps_pick = _nearest_ref_by_gps(photo_stems, matches, model_dir=model_dir)
     if gps_pick is not None:
         return gps_pick
 
@@ -294,7 +295,7 @@ def _choose_anchor(matches: dict, photo_stems: list,
     return best
 
 
-def _nearest_ref_by_gps(photo_stems, matches):
+def _nearest_ref_by_gps(photo_stems, matches, model_dir=None):
     """Pick (anchor_stem, anchor_info) by finding the closest reference shot
     to any of the selected photos' reported GPS. Used when MegaLoc top-K
     misses but the phone's GPS is trustworthy enough to stand on its own.
@@ -302,7 +303,7 @@ def _nearest_ref_by_gps(photo_stems, matches):
     Scans the full ref_index; O(n_refs × n_photos) which is fine at the
     scales we see (12k refs × a few dozen photos).
     """
-    idx = ref_index.load()
+    idx = ref_index.load(model_dir)
     if not idx:
         return None
     best = None  # (distance, stem, shot_key, pos, radius)
@@ -615,6 +616,8 @@ def _run_register_independent(shot_id, log_path, staging_dir, matches,
     per_photo_dir.mkdir(parents=True, exist_ok=True)
     results = []  # per-photo: {stem, ok, anchor_shot, anchor_capture, mini_dir, pose?, err?}
 
+    indep_model_dir = Path(ref_entry["model_dir"]) if ref_entry and ref_entry.get("model_dir") \
+                      else None
     for i, stem in enumerate(photo_stems):
         # Decide this photo's anchor
         m = matches.get(stem) or {}
@@ -622,7 +625,7 @@ def _run_register_independent(shot_id, log_path, staging_dir, matches,
         if pick is None:
             # pure-GPS fallback for this photo
             from . import ref_index
-            idx = ref_index.load()
+            idx = ref_index.load(indep_model_dir)
             phone_lat = m.get("_phone_lat")
             phone_lon = m.get("_phone_lon")
             if idx and phone_lat is not None:
@@ -906,6 +909,15 @@ def _process_shot(shot_id: str):
         # the UI dropdown at Run time). Falls back to registry auto-select.
         ref_override = meta.get("reference_override")
 
+        # Resolve the selected reference up front so we know which
+        # geographic index to consult when annotating matches + picking
+        # anchor. Using the wrong index gives the wrong "nearest ref"
+        # in the pure-GPS fallback and breaks the whole pipeline.
+        early_ref_entry = _select_reference_for_project(project, override=ref_override)
+        ref_model_dir = None
+        if early_ref_entry and early_ref_entry.get("model_dir"):
+            ref_model_dir = Path(early_ref_entry["model_dir"])
+
         # Step 1: megaloc — runs per-project on the flat wides dir; we just
         # consume its cached output here.
         db.update_shot(shot_id, phase="megaloc", phase_label="Running MegaLoc", progress=0.05)
@@ -913,7 +925,7 @@ def _process_shot(shot_id: str):
         matches = run_megaloc_for_project(project["id"], ref_override=ref_override)
         project_meta = project.get("meta") or {}
         photo_meta = project_meta.get("photo_meta") or {}
-        _annotate_matches_with_gps(matches, photo_meta)
+        _annotate_matches_with_gps(matches, photo_meta, model_dir=ref_model_dir)
         log_append(log_path, f"[megaloc] got {len(matches)} matches total")
 
         # Anchor selection. Bundles always anchor on the wide JPEG (best
@@ -934,6 +946,7 @@ def _process_shot(shot_id: str):
         anchor_key, anchor_info = _choose_anchor(
             matches, megaloc_keys,
             pinned_stem=meta.get("anchor_override") or anchor_stem_for_pick,
+            model_dir=ref_model_dir,
         )
         anchor_shot_id = anchor_info["shot_id"]
         anchor_capture = anchor_info["capture"]
