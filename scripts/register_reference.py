@@ -123,6 +123,7 @@ def register_cmd(args):
         "faiss_dir": str(faiss_dir),
         "model_dir": str(Path(args.model_dir).resolve()) if args.model_dir else None,
         "images_url": args.images_url,
+        "priority": args.priority,
         "extent": extent,
         "meta": {
             "layout": args.layout,
@@ -142,7 +143,8 @@ def list_cmd(_args):
         return
     for e in entries:
         ext = e.get("extent") or {}
-        print(f"- {e.get('name')}")
+        prio = e.get("priority") or 0
+        print(f"- {e.get('name')}  (priority={prio})")
         print(f"    faiss:  {e.get('faiss_dir')}")
         print(f"    model:  {e.get('model_dir') or '(none)'}")
         print(f"    images: {e.get('images_url') or '(default)'}")
@@ -171,6 +173,10 @@ def main():
                    help="Where the ref images live (local path, file://, s3://, ...)")
     r.add_argument("--layout", default="split_pano", choices=["split_pano", "flat"])
     r.add_argument("--num-views", type=int, default=12)
+    r.add_argument("--priority", type=int, default=0,
+                   help="Higher priority wins when multiple references "
+                        "overlap the same area (e.g. undistorted preferred "
+                        "over pano; default 0).")
     r.set_defaults(func=register_cmd)
 
     sub.add_parser("list", help="List registered references").set_defaults(func=list_cmd)

@@ -79,20 +79,21 @@ def _contains(extent: dict, lat: float, lon: float) -> bool:
 
 
 def _score(entry: dict, points) -> tuple:
-    """Return (n_contained, -distance_to_center, name) — higher is better.
-
-    points: iterable of (lat, lon) pairs.
+    """Return (n_contained, priority, -distance_to_center, name) — higher
+    is better. When multiple references contain the same points (e.g. a
+    pano dataset and an undistorted dataset over the same area), the one
+    with a higher `priority` wins. Default priority is 0.
     """
     ext = entry.get("extent") or {}
     if not ext:
-        return (0, 0, entry.get("name", ""))
+        return (0, 0, 0, entry.get("name", ""))
     n_in = sum(1 for lat, lon in points if _contains(ext, lat, lon))
     cx = (ext["lat_min"] + ext["lat_max"]) / 2
     cy = (ext["lon_min"] + ext["lon_max"]) / 2
-    # negate distance so larger score = closer
     dists = [(lat - cx) ** 2 + (lon - cy) ** 2 for lat, lon in points]
     mean_d2 = sum(dists) / len(dists) if dists else 1e9
-    return (n_in, -mean_d2, entry.get("name", ""))
+    priority = int(entry.get("priority") or 0)
+    return (n_in, priority, -mean_d2, entry.get("name", ""))
 
 
 def select_for_points(points, nearby_deg: float = 0.005) -> dict | None:
@@ -141,6 +142,13 @@ def select_for_points(points, nearby_deg: float = 0.005) -> dict | None:
             best_nearby = e
     if best_nearby and best_dist <= nearby_deg:
         return best_nearby
+    return None
+
+
+def get_by_name(name: str) -> dict | None:
+    for e in load():
+        if e.get("name") == name:
+            return e
     return None
 
 

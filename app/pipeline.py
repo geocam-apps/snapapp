@@ -56,12 +56,19 @@ def log_append(path: Path, msg: str):
         f.write(msg + "\n")
 
 
-def _select_reference_for_project(project: dict) -> dict | None:
-    """Pick the best reference dataset for a project from the registry,
-    based on the shot GPS points in its photo_meta. Returns None when
-    the registry is empty or nothing matches — caller then falls back
-    to the env-configured single reference.
+def _select_reference_for_project(project: dict, override: str = None) -> dict | None:
+    """Pick the best reference dataset. If `override` names a registered
+    entry, returns it directly. Otherwise auto-selects by the project's
+    shot GPS. Returns None when neither applies.
     """
+    if override:
+        entry = ref_registry.get_by_name(override)
+        if entry is None:
+            raise RuntimeError(
+                f"Reference '{override}' not found in registry. "
+                f"Known: {[e['name'] for e in ref_registry.load()]}"
+            )
+        return entry
     photo_meta = (project.get("meta") or {}).get("photo_meta") or {}
     pts = []
     for m in photo_meta.values():
@@ -73,30 +80,22 @@ def _select_reference_for_project(project: dict) -> dict | None:
     return ref_registry.select_for_points(pts)
 
 
-def run_megaloc_for_project(project_id: str) -> dict:
-    """Run MegaLoc on all photos in a project, cache result CSV.
-
-    Returns {"photo_stem": {"shot_key": str, "score": float, "capture": str}, ...}
+def run_megaloc_for_project(project_id: str, ref_override: str = None) -> dict:
+    """Run MegaLoc on all photos in a project, cache result CSV per
+    reference. `ref_override` names a specific registry entry to use
+    instead of the auto-selected one.
     """
     project = db.get_project(project_id)
     if project is None:
         raise RuntimeError("Project not found")
 
-    # Run MegaLoc against the flat one-per-shot dir of wide JPEGs, not the
-    # per-shot bundle subdirs. Match keys end up as `shot_<id:05d>`.
     photos_dir = paths.project_megaloc_in_dir(project_id)
     if not photos_dir.exists() or not any(photos_dir.iterdir()):
-        # Legacy projects (or image-uploaded projects) used the flat
-        # photos/ directly.
         photos_dir = paths.project_photos_dir(project_id)
-    csv_path = paths.project_megaloc_csv(project_id)
-    ref_sidecar = csv_path.with_suffix(".ref")
     log_path = paths.project_dir(project_id) / "megaloc.log"
 
-    # Pick a reference dataset from the registry based on this project's
-    # shot GPS. Falls back to paths.MEGALOC_DB / paths.MEGALOC_GCDB_DIR
-    # when the registry is empty or nothing geographic matches.
-    ref_entry = _select_reference_for_project(project)
+    # Pick the reference (explicit override wins).
+    ref_entry = _select_reference_for_project(project, override=ref_override)
     if ref_entry:
         db_dir = ref_entry["faiss_dir"]
         gcdb_dir = ref_entry.get("gcdb_dir") or str(paths.MEGALOC_GCDB_DIR)
@@ -104,22 +103,12 @@ def run_megaloc_for_project(project_id: str) -> dict:
     else:
         db_dir = str(paths.MEGALOC_DB)
         gcdb_dir = str(paths.MEGALOC_GCDB_DIR)
-        ref_key = f"env:{db_dir}"
+        ref_key = f"env:{Path(db_dir).name}"
 
-    # Invalidate the cached CSV if it was produced against a different
-    # reference (e.g. the project was re-uploaded after a registry change,
-    # or started as a Lomita match but now gets matched to Costa Mesa).
+    csv_path = paths.project_megaloc_csv(project_id, ref_key=ref_key)
     if csv_path.exists():
-        cached_ref = ref_sidecar.read_text().strip() if ref_sidecar.exists() else ""
-        if cached_ref != ref_key:
-            log_append(log_path,
-                       f"[megaloc] cached CSV was for {cached_ref or '(unknown)'} "
-                       f"but registry now picks {ref_key}; re-running")
-            csv_path.unlink()
-            if ref_sidecar.exists():
-                ref_sidecar.unlink()
-        else:
-            return _read_megaloc_csv(csv_path)
+        # Already ran MegaLoc against this exact reference — reuse.
+        return _read_megaloc_csv(csv_path)
 
     log_append(log_path, f"[megaloc] using reference '{ref_key}' (faiss={db_dir})")
 
@@ -144,9 +133,6 @@ def run_megaloc_for_project(project_id: str) -> dict:
         log_append(log_path, f"[megaloc] stderr:\n{proc.stderr[-2000:]}")
         raise RuntimeError(f"MegaLoc failed: {proc.stderr[-500:]}")
 
-    # Record which reference produced this CSV so a later reference
-    # change invalidates the cache instead of reusing stale matches.
-    ref_sidecar.write_text(ref_key)
     return _read_megaloc_csv(csv_path)
 
 
@@ -916,11 +902,15 @@ def _process_shot(shot_id: str):
                 raise RuntimeError(f"Photo '{name}' not found in {photos_root}")
             photo_files.append(full)
 
+        # Per-shot reference override (set when the user picks a ref from
+        # the UI dropdown at Run time). Falls back to registry auto-select.
+        ref_override = meta.get("reference_override")
+
         # Step 1: megaloc — runs per-project on the flat wides dir; we just
         # consume its cached output here.
         db.update_shot(shot_id, phase="megaloc", phase_label="Running MegaLoc", progress=0.05)
         log_append(log_path, "[megaloc] running...")
-        matches = run_megaloc_for_project(project["id"])
+        matches = run_megaloc_for_project(project["id"], ref_override=ref_override)
         project_meta = project.get("meta") or {}
         photo_meta = project_meta.get("photo_meta") or {}
         _annotate_matches_with_gps(matches, photo_meta)
@@ -987,10 +977,8 @@ def _process_shot(shot_id: str):
         db.update_shot(shot_id, phase="sfm", phase_label="Preparing SFM",
                        progress=0.15, n_queries=len(photo_files))
 
-        # Re-select the same reference the MegaLoc step used so the SFM
-        # subprocess gets the matching model dir + image source. When no
-        # registry entry matches, env-configured defaults apply.
-        ref_entry = _select_reference_for_project(project)
+        # Re-select the same reference the MegaLoc step used.
+        ref_entry = _select_reference_for_project(project, override=ref_override)
         if ref_entry:
             log_append(log_path, f"[sfm] reference '{ref_entry['name']}'")
 

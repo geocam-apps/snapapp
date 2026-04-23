@@ -18,7 +18,7 @@ try:
 except ImportError:
     pass
 
-from app import db, paths, pipeline, gcdb_read, geocam_api
+from app import db, paths, pipeline, gcdb_read, geocam_api, ref_registry
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
@@ -731,6 +731,24 @@ def api_create_shot(project_id):
     return jsonify({"shot_id": sid})
 
 
+@app.route("/api/references")
+def api_references():
+    """List the reference datasets available for Run override."""
+    entries = ref_registry.load()
+    # Sort by priority desc, then name asc, for stable UI ordering
+    entries.sort(key=lambda e: (-int(e.get("priority") or 0), e.get("name", "")))
+    # Strip extent points count (noisy), keep the summary the UI needs
+    return jsonify({
+        "items": [{
+            "name": e.get("name"),
+            "priority": e.get("priority") or 0,
+            "has_model": bool(e.get("model_dir")),
+            "extent": e.get("extent"),
+            "meta": e.get("meta") or {},
+        } for e in entries]
+    })
+
+
 @app.route("/api/projects/<project_id>/cells-search", methods=["POST"])
 def api_project_cells_search(project_id):
     """Ask the GeoCam manager-api which `cells` contain this project's shots.
@@ -788,15 +806,37 @@ def api_project_cells_search(project_id):
     return jsonify(result)
 
 
+def _stash_reference_override(shot_id: str, ref_name: str):
+    """Persist the user's per-shot reference choice into shot meta so
+    _process_shot picks it up (with no registry auto-selection)."""
+    s = db.get_shot(shot_id)
+    if not s:
+        return
+    meta = dict(s.get("meta") or {})
+    if ref_name:
+        meta["reference_override"] = ref_name
+    else:
+        meta.pop("reference_override", None)
+    db.update_shot(shot_id, meta=meta)
+
+
 @app.route("/api/projects/<project_id>/run", methods=["POST"])
 def api_run_project(project_id):
-    """Kick off SFM for every pending or failed shot in this project.
-    Optional JSON body {"shot_ids": [...]} restricts to a selection."""
+    """Kick off SFM for pending/failed shots in this project.
+
+    Optional JSON body:
+      shot_ids:  restrict to these ids
+      reference: name of a registered reference; stashed on each queued
+                 shot as an override so they all run against the same one
+    """
     p = db.get_project(project_id)
     if p is None:
         abort(404)
     body = request.get_json(silent=True) or {}
     only = set(body.get("shot_ids") or [])
+    ref_name = (body.get("reference") or "").strip() or None
+    if ref_name and ref_registry.get_by_name(ref_name) is None:
+        return jsonify({"error": f"Unknown reference '{ref_name}'"}), 400
     queued = []
     for s in db.list_shots(project_id):
         if only and s["id"] not in only:
@@ -805,9 +845,12 @@ def api_run_project(project_id):
             continue
         if not (s.get("meta") or {}).get("photo_names"):
             continue
+        if ref_name is not None:
+            _stash_reference_override(s["id"], ref_name)
         pipeline.run_shot(s["id"])
         queued.append(s["id"])
-    return jsonify({"queued": queued, "count": len(queued)})
+    return jsonify({"queued": queued, "count": len(queued),
+                    "reference": ref_name})
 
 
 @app.route("/api/shots/<shot_id>/run", methods=["POST"])
@@ -820,8 +863,15 @@ def api_run_shot(shot_id):
     stems = (shot.get("meta") or {}).get("photo_stems") or []
     if not stems:
         return jsonify({"error": "Shot has no photos."}), 400
+    body = request.get_json(silent=True) or {}
+    ref_name = (body.get("reference") or "").strip() or None
+    if ref_name and ref_registry.get_by_name(ref_name) is None:
+        return jsonify({"error": f"Unknown reference '{ref_name}'"}), 400
+    # Empty-string in body clears the override (back to auto-select).
+    if "reference" in body:
+        _stash_reference_override(shot_id, ref_name)
     pipeline.run_shot(shot_id)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "reference": ref_name})
 
 
 @app.route("/api/shots/<shot_id>", methods=["DELETE"])

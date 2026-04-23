@@ -77,7 +77,13 @@ def new_project_sqlite_path(project_id: str, original_filename: str) -> Path:
     return project_dir(project_id) / f"upload{ext}"
 
 
-def project_megaloc_csv(project_id: str) -> Path:
+def project_megaloc_csv(project_id: str, ref_key: str = None) -> Path:
+    """Cached MegaLoc CSV path. Keyed per reference so switching refs
+    between runs reuses results without re-running match_photos."""
+    if ref_key:
+        # Replace any filesystem-unfriendly chars
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in ref_key)
+        return project_dir(project_id) / f"megaloc.{safe}.csv"
     return project_dir(project_id) / "megaloc.csv"
 
 

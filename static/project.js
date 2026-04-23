@@ -3,10 +3,22 @@
 const PROJECT_ID = window.PROJECT_ID;
 
 let latestProject = null;
-const selected = new Set();          // shot ids selected for "Run selected"
-const openLogs = new Set();          // shot ids whose log pane is expanded
-const logCache = new Map();          // shot_id -> last fetched log text
-const logScrollState = new Map();    // shot_id -> {scrollTop, pinnedBottom}
+let references = [];                  // cached from /api/references
+const selected = new Set();           // shot ids selected for "Run selected"
+const openLogs = new Set();           // shot ids whose log pane is expanded
+const logCache = new Map();           // shot_id -> last fetched log text
+const logScrollState = new Map();     // shot_id -> {scrollTop, pinnedBottom}
+
+async function loadReferences() {
+  try {
+    const r = await fetch("/api/references");
+    const data = await r.json();
+    references = data.items || [];
+  } catch (e) {
+    references = [];
+  }
+}
+loadReferences();
 
 async function loadProject() {
   const r = await fetch(`/api/projects/${PROJECT_ID}`);
@@ -117,6 +129,7 @@ function renderShotTiles(p) {
         </div>
         ${meta.lat != null ? `<div class="meta">${meta.lat.toFixed(5)}, ${meta.lon.toFixed(5)}${
           meta.bearing_deg != null ? ` · ${Math.round(meta.bearing_deg)}°` : ""}</div>` : ""}
+        ${meta.reference_override ? `<div class="meta">ref: <b>${escapeHtml(meta.reference_override)}</b></div>` : ""}
         ${progressBar}
         ${s.error ? `<div class="meta err">${escapeHtml(s.error)}</div>` : ""}
         <div class="actions">
@@ -160,8 +173,17 @@ function renderShotTiles(p) {
     b.addEventListener("click", async (ev) => {
       ev.stopPropagation();
       const id = b.dataset.id;
+      const ref = await pickReference(
+        "Run this shot against which reference?",
+        getShotRef(id),
+      );
+      if (ref === null) return;  // cancelled
       b.disabled = true;
-      const r = await fetch(`/api/shots/${id}/run`, {method: "POST"});
+      const r = await fetch(`/api/shots/${id}/run`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({reference: ref}),
+      });
       if (!r.ok) alert("Failed to run: " + (await r.text()));
       loadProject();
     })
@@ -274,26 +296,85 @@ function renderSqlite(info, projMeta) {
 
 document.getElementById("runSelectedBtn").addEventListener("click", async () => {
   if (selected.size === 0) return;
+  const ref = await pickReference(
+    `Run ${selected.size} selected shot(s) against which reference?`,
+  );
+  if (ref === null) return;
   const r = await fetch(`/api/projects/${PROJECT_ID}/run`, {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({shot_ids: [...selected]}),
+    body: JSON.stringify({shot_ids: [...selected], reference: ref}),
   });
   if (!r.ok) { alert("Failed: " + await r.text()); return; }
   const data = await r.json();
   selected.clear();
   loadProject();
-  alert(`Queued ${data.count} shot(s).`);
+  alert(`Queued ${data.count} shot(s)${ref ? ` against ${ref}` : ""}.`);
 });
 
 document.getElementById("runAllBtn").addEventListener("click", async () => {
-  if (!confirm("Run SFM on every pending or failed shot in this project?")) return;
-  const r = await fetch(`/api/projects/${PROJECT_ID}/run`, {method: "POST"});
+  const ref = await pickReference(
+    "Run SFM on every pending or failed shot — against which reference?",
+  );
+  if (ref === null) return;
+  const r = await fetch(`/api/projects/${PROJECT_ID}/run`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({reference: ref}),
+  });
   if (!r.ok) { alert("Failed: " + await r.text()); return; }
   const data = await r.json();
   loadProject();
-  alert(`Queued ${data.count} shot(s).`);
+  alert(`Queued ${data.count} shot(s)${ref ? ` against ${ref}` : ""}.`);
 });
+
+function getShotRef(shotId) {
+  const s = (latestProject?.shots || []).find(x => x.id === shotId);
+  return (s?.meta || {}).reference_override || "";
+}
+
+// A small modal that asks the user to pick one of the registered
+// references. Returns: the chosen reference name (string), "" to mean
+// "auto-pick by GPS", or null if the user cancelled.
+function pickReference(title, current = "") {
+  return new Promise(resolve => {
+    if (!references.length) { resolve(""); return; }  // registry empty — auto
+    const overlay = document.createElement("div");
+    overlay.className = "modal";
+    overlay.innerHTML = `
+      <div class="modal-inner" style="max-width:480px">
+        <div class="modal-hdr">
+          <h3>${escapeHtml(title)}</h3>
+        </div>
+        <div class="modal-body">
+          <label style="display:block; margin:6px 0"><input type="radio" name="ref-pick" value=""
+            ${current === "" ? "checked" : ""}> Auto-pick by GPS <span style="color:#6b7280">(use registry priority)</span></label>
+          ${references.map(r => `
+            <label style="display:block; margin:6px 0">
+              <input type="radio" name="ref-pick" value="${escapeHtml(r.name)}"
+                ${current === r.name ? "checked" : ""}>
+              ${escapeHtml(r.name)}
+              <span style="color:#6b7280; font-size:11px">
+                priority ${r.priority}${r.has_model ? "" : " · MegaLoc-only"}
+              </span>
+            </label>`).join("")}
+          <div style="margin-top:16px; display:flex; gap:8px; justify-content:flex-end">
+            <button id="_cancel" class="small secondary">Cancel</button>
+            <button id="_ok" class="small">Run</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector("#_ok").addEventListener("click", () => {
+      const sel = overlay.querySelector('input[name="ref-pick"]:checked');
+      overlay.remove();
+      resolve(sel ? sel.value : "");
+    });
+    overlay.querySelector("#_cancel").addEventListener("click", () => {
+      overlay.remove(); resolve(null);
+    });
+  });
+}
 
 document.getElementById("searchCellsBtn").addEventListener("click", async () => {
   const modal = document.getElementById("cellsModal");
