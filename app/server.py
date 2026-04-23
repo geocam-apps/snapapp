@@ -124,17 +124,29 @@ def api_project(project_id):
         p["sqlite"]["poses_sample"] = gcdb_read.list_poses(sqlite_path, limit=50)
     # Include MegaLoc matches if available, GPS-annotated against the phone's
     # reported lat/lon so the UI can show distance badges.
-    csv_path = paths.project_megaloc_csv(project_id)
+    # Figure out which reference the pipeline would pick for this project
+    # and display the matches + distances from that one (so the UI reflects
+    # what a Run actually uses). Falls back to the legacy un-keyed CSV.
+    ref_entry = pipeline._select_reference_for_project(p)
+    ref_model_dir = None
+    csv_path = None
+    if ref_entry:
+        csv_path = paths.project_megaloc_csv(project_id, ref_key=ref_entry["name"])
+        if ref_entry.get("model_dir"):
+            ref_model_dir = Path(ref_entry["model_dir"])
+    if csv_path is None or not csv_path.exists():
+        csv_path = paths.project_megaloc_csv(project_id)
     p["megaloc_ready"] = csv_path.exists()
     p["megaloc_running"] = project_id in pipeline.MEGALOC_RUNNING
+    p["megaloc_reference"] = ref_entry["name"] if ref_entry else None
     if csv_path.exists():
         try:
             matches = pipeline._read_megaloc_csv(csv_path)
             pipeline._annotate_matches_with_gps(
                 matches, (p.get("meta") or {}).get("photo_meta") or {},
+                model_dir=ref_model_dir,
             )
-            # Drop the leading-underscore internals (_phone_lat/_phone_lon)
-            # from the API payload — they're only for pipeline internal use.
+            # Drop the leading-underscore internals from the API payload.
             for m in matches.values():
                 for k in list(m.keys()):
                     if k.startswith("_"):
