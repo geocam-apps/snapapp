@@ -130,6 +130,13 @@ function renderShotTiles(p) {
         ${meta.lat != null ? `<div class="meta">${meta.lat.toFixed(5)}, ${meta.lon.toFixed(5)}${
           meta.bearing_deg != null ? ` · ${Math.round(meta.bearing_deg)}°` : ""}</div>` : ""}
         ${meta.reference_override ? `<div class="meta">ref: <b>${escapeHtml(meta.reference_override)}</b></div>` : ""}
+        ${displayMatch ? `<div class="meta">→ ref <code>${escapeHtml((displayMatch.shot_key || "").split('/').pop())}</code>
+          · MegaLoc ${displayMatch.score.toFixed(3)}${
+            displayMatch.distance_m != null
+              ? ` · phone→ref <b style="color:${displayMatch.gps_valid ? "#065f46" : "#991b1b"}">${
+                  displayMatch.distance_m < 1000
+                    ? Math.round(displayMatch.distance_m) + " m"
+                    : (displayMatch.distance_m/1000).toFixed(1) + " km"}</b>` : ""}</div>` : ""}
         ${progressBar}
         ${s.error ? `<div class="meta err">${escapeHtml(s.error)}</div>` : ""}
         <div class="actions">
